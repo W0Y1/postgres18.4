@@ -5520,6 +5520,12 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;
+	dest->plan_replay_path_sequence_valid = src->plan_replay_path_sequence_valid;
+	dest->plan_replay_path_sequence = src->plan_replay_path_sequence;
+	dest->plan_replay_cardinality_sequence_valid =
+		src->plan_replay_cardinality_sequence_valid;
+	dest->plan_replay_cardinality_sequence =
+		src->plan_replay_cardinality_sequence;
 }
 
 /*

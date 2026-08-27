@@ -1,0 +1,4 @@
+comment = 'offline planner estimate capture and sequential replay'
+default_version = '1.0'
+module_pathname = '$libdir/pg_plan_replay'
+relocatable = true

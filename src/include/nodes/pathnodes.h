@@ -899,6 +899,9 @@ typedef struct RelOptInfo
 	 */
 	/* estimated number of result tuples */
 	Cardinality rows;
+	/* pg_plan_replay estimate that produced rows, when available */
+	bool		plan_replay_cardinality_sequence_valid;
+	uint64		plan_replay_cardinality_sequence;
 
 	/*
 	 * per-relation planner control flags
@@ -920,8 +923,10 @@ typedef struct RelOptInfo
 	 * materialization information
 	 */
 	List	   *pathlist;		/* Path structures */
+	List	   *path_cost_model_pending; /* paths awaiting external cost */
 	List	   *ppilist;		/* ParamPathInfos used in pathlist */
 	List	   *partial_pathlist;	/* partial Paths */
+	List	   *partial_path_cost_model_pending; /* partial paths awaiting cost */
 	struct Path *cheapest_startup_path;
 	struct Path *cheapest_total_path;
 	struct Path *cheapest_unique_path;
@@ -1712,6 +1717,9 @@ typedef struct ParamPathInfo
 
 	Relids		ppi_req_outer;	/* rels supplying parameters used by path */
 	Cardinality ppi_rows;		/* estimated number of result tuples */
+	/* pg_plan_replay estimate that produced ppi_rows, when available */
+	bool		plan_replay_cardinality_sequence_valid;
+	uint64		plan_replay_cardinality_sequence;
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
 	Bitmapset  *ppi_serials;	/* set of rinfo_serial for enforced quals */
 } ParamPathInfo;
@@ -1795,6 +1803,12 @@ typedef struct Path
 	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
+
+	/* pg_plan_replay candidate sequence, valid only while its hook is active */
+	bool		plan_replay_path_sequence_valid;
+	uint64		plan_replay_path_sequence;
+	bool		plan_replay_cardinality_sequence_valid;
+	uint64		plan_replay_cardinality_sequence;
 
 	/* sort ordering of path's output; a List of PathKey nodes; see above */
 	List	   *pathkeys;

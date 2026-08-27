@@ -1671,6 +1671,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	List	   *eclauses;
 	List	   *dropped_ecs;
 	double		rows;
+	bool		sequence_valid = false;
+	uint64		sequence = 0;
 	ListCell   *lc;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
@@ -1823,7 +1825,9 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 										  outer_path,
 										  inner_path,
 										  sjinfo,
-										  *restrict_clauses);
+										  *restrict_clauses,
+										  &sequence_valid,
+										  &sequence);
 
 	/*
 	 * And now we can build the ParamPathInfo.  No point in saving the
@@ -1835,6 +1839,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
+	ppi->plan_replay_cardinality_sequence_valid = sequence_valid;
+	ppi->plan_replay_cardinality_sequence = sequence;
 	ppi->ppi_clauses = NIL;
 	ppi->ppi_serials = NULL;
 	joinrel->ppilist = lappend(joinrel->ppilist, ppi);

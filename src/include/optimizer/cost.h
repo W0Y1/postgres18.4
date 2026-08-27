@@ -40,6 +40,28 @@ typedef enum
 	CONSTRAINT_EXCLUSION_PARTITION, /* apply c_e to otherrels only */
 }			ConstraintExclusionType;
 
+typedef enum CardinalityEstimateKind
+{
+	CARDINALITY_ESTIMATE_BASE,
+	CARDINALITY_ESTIMATE_JOIN,
+	CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN
+} CardinalityEstimateKind;
+
+typedef Cardinality (*cardinality_estimate_hook_type) (PlannerInfo *root,
+														CardinalityEstimateKind kind,
+														RelOptInfo *rel,
+														RelOptInfo *outer_rel,
+														RelOptInfo *inner_rel,
+														SpecialJoinInfo *sjinfo,
+														List *restrictlist,
+														Cardinality outer_rows,
+														Cardinality inner_rows,
+														Cardinality native_rows,
+														bool *sequence_valid,
+														uint64 *sequence);
+
+extern PGDLLIMPORT cardinality_estimate_hook_type cardinality_estimate_hook;
+
 
 /*
  * prototypes for costsize.c
@@ -198,11 +220,13 @@ extern double get_parameterized_baserel_size(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 List *param_clauses);
 extern double get_parameterized_joinrel_size(PlannerInfo *root,
-											 RelOptInfo *rel,
-											 Path *outer_path,
-											 Path *inner_path,
-											 SpecialJoinInfo *sjinfo,
-											 List *restrict_clauses);
+										 RelOptInfo *rel,
+										 Path *outer_path,
+										 Path *inner_path,
+										 SpecialJoinInfo *sjinfo,
+										 List *restrict_clauses,
+										 bool *sequence_valid,
+										 uint64 *sequence);
 extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 									   RelOptInfo *outer_rel,
 									   RelOptInfo *inner_rel,

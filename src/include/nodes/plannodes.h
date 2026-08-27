@@ -198,6 +198,11 @@ typedef struct Plan
 	 */
 	/* unique across entire final plan tree */
 	int			plan_node_id;
+	/* pg_plan_replay candidate Path that produced this Plan node, when available */
+	bool		plan_replay_path_sequence_valid;
+	uint64		plan_replay_path_sequence;
+	bool		plan_replay_cardinality_sequence_valid;
+	uint64		plan_replay_cardinality_sequence;
 	/* target list to be computed at this node */
 	List	   *targetlist;
 	/* implicitly-ANDed qual conditions */

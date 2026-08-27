@@ -18,6 +18,16 @@
 #include "nodes/pathnodes.h"
 
 
+/* Optional relation-local processing before native Path cost pruning. */
+typedef bool (*path_cost_model_active_hook_type) (void);
+typedef void (*path_cost_model_batch_hook_type) (RelOptInfo *rel,
+												 List *paths,
+												 bool partial);
+extern PGDLLIMPORT path_cost_model_active_hook_type path_cost_model_active_hook;
+extern PGDLLIMPORT path_cost_model_batch_hook_type path_cost_model_batch_hook;
+
+extern void flush_path_cost_model(RelOptInfo *parent_rel);
+
 /*
  * prototypes for pathnode.c
  */

@@ -164,6 +164,8 @@ bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
+cardinality_estimate_hook_type cardinality_estimate_hook = NULL;
+
 typedef struct
 {
 	PlannerInfo *root;
@@ -190,7 +192,10 @@ static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 double outer_rows,
 										 double inner_rows,
 										 SpecialJoinInfo *sjinfo,
-										 List *restrictlist);
+										 List *restrictlist,
+										 bool parameterized,
+										 bool *sequence_valid,
+										 uint64 *sequence);
 static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 													Relids outer_relids,
 													Relids inner_relids,
@@ -5365,6 +5370,21 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);
+
+	if (cardinality_estimate_hook != NULL)
+	{
+		bool		sequence_valid = false;
+		uint64		sequence = 0;
+
+		rel->rows = clamp_row_est(cardinality_estimate_hook(root,
+														 CARDINALITY_ESTIMATE_BASE,
+														 rel, NULL, NULL, NULL,
+														 rel->baserestrictinfo,
+														 0, 0, nrows,
+														 &sequence_valid, &sequence));
+		rel->plan_replay_cardinality_sequence_valid = sequence_valid;
+		rel->plan_replay_cardinality_sequence = sequence;
+	}
 }
 
 /*
@@ -5438,7 +5458,10 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   outer_rel->rows,
 										   inner_rel->rows,
 										   sjinfo,
-										   restrictlist);
+										   restrictlist,
+										   false,
+										   &rel->plan_replay_cardinality_sequence_valid,
+										   &rel->plan_replay_cardinality_sequence);
 }
 
 /*
@@ -5458,10 +5481,12 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  */
 double
 get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
-							   Path *outer_path,
-							   Path *inner_path,
-							   SpecialJoinInfo *sjinfo,
-							   List *restrict_clauses)
+								Path *outer_path,
+								Path *inner_path,
+								SpecialJoinInfo *sjinfo,
+								List *restrict_clauses,
+								bool *sequence_valid,
+								uint64 *sequence)
 {
 	double		nrows;
 
@@ -5481,7 +5506,10 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 									   outer_path->rows,
 									   inner_path->rows,
 									   sjinfo,
-									   restrict_clauses);
+									   restrict_clauses,
+									   true,
+									   sequence_valid,
+									   sequence);
 	/* For safety, make sure result is not more than the base estimate */
 	if (nrows > rel->rows)
 		nrows = rel->rows;
@@ -5505,8 +5533,12 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 						   double outer_rows,
 						   double inner_rows,
 						   SpecialJoinInfo *sjinfo,
-						   List *restrictlist)
+						   List *restrictlist,
+						   bool parameterized,
+						   bool *sequence_valid,
+						   uint64 *sequence)
 {
+	List	   *original_restrictlist = restrictlist;
 	JoinType	jointype = sjinfo->jointype;
 	Selectivity fkselec;
 	Selectivity jselec;
@@ -5628,6 +5660,16 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 			nrows = 0;			/* keep compiler quiet */
 			break;
 	}
+
+	if (cardinality_estimate_hook != NULL)
+		nrows = cardinality_estimate_hook(root,
+										parameterized ?
+										CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN :
+										CARDINALITY_ESTIMATE_JOIN,
+										joinrel, outer_rel, inner_rel, sjinfo,
+										original_restrictlist,
+										outer_rows, inner_rows, nrows,
+										sequence_valid, sequence);
 
 	return clamp_row_est(nrows);
 }

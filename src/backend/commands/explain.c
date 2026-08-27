@@ -1792,6 +1792,26 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 	}
 
+	if (plan->plan_replay_path_sequence_valid)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str, " (plan_replay_sequence=" UINT64_FORMAT ")",
+								 plan->plan_replay_path_sequence);
+		else
+			ExplainPropertyUInteger("Plan Replay Sequence", NULL,
+									plan->plan_replay_path_sequence, es);
+	}
+	if (plan->plan_replay_cardinality_sequence_valid)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str,
+							 " (plan_replay_cardinality_sequence=" UINT64_FORMAT ")",
+							 plan->plan_replay_cardinality_sequence);
+		else
+			ExplainPropertyUInteger("Plan Replay Cardinality Sequence", NULL,
+									plan->plan_replay_cardinality_sequence, es);
+	}
+
 	if (es->costs)
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)

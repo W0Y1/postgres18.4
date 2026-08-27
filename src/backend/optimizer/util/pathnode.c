@@ -49,6 +49,12 @@ typedef enum
  */
 #define STD_FUZZ_FACTOR 1.01
 
+path_cost_model_active_hook_type path_cost_model_active_hook = NULL;
+path_cost_model_batch_hook_type path_cost_model_batch_hook = NULL;
+
+static void add_path_native(RelOptInfo *parent_rel, Path *new_path);
+static void add_partial_path_native(RelOptInfo *parent_rel, Path *new_path);
+
 static List *translate_sub_tlist(List *tlist, int relid);
 static int	append_total_cost_compare(const ListCell *a, const ListCell *b);
 static int	append_startup_cost_compare(const ListCell *a, const ListCell *b);
@@ -242,6 +248,43 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 }
 
 /*
+ * Process relation-local candidates before replaying PostgreSQL's native
+ * property-aware add_path tournaments.
+ */
+void
+flush_path_cost_model(RelOptInfo *parent_rel)
+{
+	List	   *paths;
+	ListCell   *cell;
+
+	if (path_cost_model_active_hook == NULL ||
+		!path_cost_model_active_hook())
+		return;
+
+	paths = parent_rel->path_cost_model_pending;
+	if (paths != NIL)
+	{
+		if (path_cost_model_batch_hook != NULL)
+			path_cost_model_batch_hook(parent_rel, paths, false);
+		parent_rel->path_cost_model_pending = NIL;
+		foreach(cell, paths)
+			add_path_native(parent_rel, (Path *) lfirst(cell));
+		list_free(paths);
+	}
+
+	paths = parent_rel->partial_path_cost_model_pending;
+	if (paths != NIL)
+	{
+		if (path_cost_model_batch_hook != NULL)
+			path_cost_model_batch_hook(parent_rel, paths, true);
+		parent_rel->partial_path_cost_model_pending = NIL;
+		foreach(cell, paths)
+			add_partial_path_native(parent_rel, (Path *) lfirst(cell));
+		list_free(paths);
+	}
+}
+
+/*
  * set_cheapest
  *	  Find the minimum-cost paths from among a relation's paths,
  *	  and save them in the rel's cheapest-path fields.
@@ -278,6 +321,8 @@ set_cheapest(RelOptInfo *parent_rel)
 	ListCell   *p;
 
 	Assert(IsA(parent_rel, RelOptInfo));
+
+	flush_path_cost_model(parent_rel);
 
 	if (parent_rel->pathlist == NIL)
 		elog(ERROR, "could not devise a query plan for the given query");
@@ -460,8 +505,8 @@ set_cheapest(RelOptInfo *parent_rel)
  *
  * Returns nothing, but modifies parent_rel->pathlist.
  */
-void
-add_path(RelOptInfo *parent_rel, Path *new_path)
+static void
+add_path_native(RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
@@ -671,6 +716,37 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 }
 
 /*
+ * Active consumers see every legal candidate before cost-based pruning.
+ * Upper relations are processed synchronously because they have no matching
+ * relation pathlist hook at which to flush a batch.
+ */
+void
+add_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	if (path_cost_model_active_hook != NULL &&
+		path_cost_model_active_hook())
+	{
+		if (IS_UPPER_REL(parent_rel))
+		{
+			List *paths = list_make1(new_path);
+
+			if (path_cost_model_batch_hook != NULL)
+				path_cost_model_batch_hook(parent_rel, paths, false);
+			list_free(paths);
+			add_path_native(parent_rel, new_path);
+			return;
+		}
+
+		CHECK_FOR_INTERRUPTS();
+		parent_rel->path_cost_model_pending =
+			lappend(parent_rel->path_cost_model_pending, new_path);
+		return;
+	}
+
+	add_path_native(parent_rel, new_path);
+}
+
+/*
  * add_path_precheck
  *	  Check whether a proposed new path could possibly get accepted.
  *	  We assume we know the path's pathkeys and parameterization accurately,
@@ -695,6 +771,10 @@ add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 	List	   *new_path_pathkeys;
 	bool		consider_startup;
 	ListCell   *p1;
+
+	if (path_cost_model_active_hook != NULL &&
+		path_cost_model_active_hook())
+		return true;
 
 	/* Pretend parameterized paths have no pathkeys, per add_path policy */
 	new_path_pathkeys = required_outer ? NIL : pathkeys;
@@ -794,8 +874,8 @@ add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
  *	  take an exception for IndexPaths as partial index paths won't be
  *	  referenced by partial BitmapHeapPaths.
  */
-void
-add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+static void
+add_partial_path_native(RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
@@ -910,6 +990,34 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	}
 }
 
+void
+add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	if (path_cost_model_active_hook != NULL &&
+		path_cost_model_active_hook())
+	{
+		if (IS_UPPER_REL(parent_rel))
+		{
+			List *paths = list_make1(new_path);
+
+			if (path_cost_model_batch_hook != NULL)
+				path_cost_model_batch_hook(parent_rel, paths, true);
+			list_free(paths);
+			add_partial_path_native(parent_rel, new_path);
+			return;
+		}
+
+		CHECK_FOR_INTERRUPTS();
+		Assert(new_path->parallel_safe);
+		Assert(parent_rel->consider_parallel);
+		parent_rel->partial_path_cost_model_pending =
+			lappend(parent_rel->partial_path_cost_model_pending, new_path);
+		return;
+	}
+
+	add_partial_path_native(parent_rel, new_path);
+}
+
 /*
  * add_partial_path_precheck
  *	  Check whether a proposed new partial path could possibly get accepted.
@@ -925,6 +1033,10 @@ add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 						  Cost total_cost, List *pathkeys)
 {
 	ListCell   *p1;
+
+	if (path_cost_model_active_hook != NULL &&
+		path_cost_model_active_hook())
+		return true;
 
 	/*
 	 * Our goal here is twofold.  First, we want to find out whether this path
@@ -4663,6 +4775,10 @@ do { \
 		new_ppi = makeNode(ParamPathInfo);
 		new_ppi->ppi_req_outer = bms_copy(required_outer);
 		new_ppi->ppi_rows = old_ppi->ppi_rows;
+		new_ppi->plan_replay_cardinality_sequence_valid =
+			old_ppi->plan_replay_cardinality_sequence_valid;
+		new_ppi->plan_replay_cardinality_sequence =
+			old_ppi->plan_replay_cardinality_sequence;
 		new_ppi->ppi_clauses = old_ppi->ppi_clauses;
 		ADJUST_CHILD_ATTRS(new_ppi->ppi_clauses);
 		new_ppi->ppi_serials = bms_copy(old_ppi->ppi_serials);
