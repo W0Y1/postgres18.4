@@ -1801,6 +1801,18 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainPropertyUInteger("Plan Replay Sequence", NULL,
 									plan->plan_replay_path_sequence, es);
 	}
+	if (plan->plan_replay_path_id_valid &&
+		plan->plan_replay_path_sequence_valid)
+	{
+		char		path_id[33];
+
+		snprintf(path_id, sizeof(path_id), "%016" PRIx64 "%016" PRIx64,
+				 plan->plan_replay_path_id_hi, plan->plan_replay_path_id_lo);
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str, " (plan_replay_path_id=%s)", path_id);
+		else
+			ExplainPropertyText("Plan Replay Path ID", path_id, es);
+	}
 	if (plan->plan_replay_cardinality_sequence_valid)
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)

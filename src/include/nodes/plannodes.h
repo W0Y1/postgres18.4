@@ -201,6 +201,9 @@ typedef struct Plan
 	/* pg_plan_replay candidate Path that produced this Plan node, when available */
 	bool		plan_replay_path_sequence_valid;
 	uint64		plan_replay_path_sequence;
+	bool		plan_replay_path_id_valid;
+	uint64		plan_replay_path_id_hi;
+	uint64		plan_replay_path_id_lo;
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
 	/* target list to be computed at this node */

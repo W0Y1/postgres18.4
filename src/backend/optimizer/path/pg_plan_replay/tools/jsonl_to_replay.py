@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -11,6 +12,10 @@ from pathlib import Path
 
 class ConversionError(ValueError):
     pass
+
+
+PATH_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+COSTS_HEADER = "# pg_plan_replay_costs format=2\n"
 
 
 def default_costs_path(path):
@@ -75,10 +80,15 @@ def numeric_value(path, line_number, container, field):
 
 
 def convert_costs(path):
-    output = []
+    output = [COSTS_HEADER]
 
     for expected, (line_number, record) in enumerate(load_jsonl(path)):
         validate_sequence(path, line_number, record, expected)
+        path_id = record.get("path_id")
+        if not isinstance(path_id, str) or not PATH_ID_PATTERN.fullmatch(path_id):
+            raise ConversionError(
+                f"{path}:{line_number}: path_id must be 32 lowercase hex digits"
+            )
         path_record = record.get("path")
         if not isinstance(path_record, dict):
             raise ConversionError(
@@ -92,7 +102,6 @@ def convert_costs(path):
             raise ConversionError(
                 f"{path}:{line_number}: startup_cost exceeds total_cost"
             )
-        output.append(f"{startup_cost:.17g} {total_cost:.17g}\n")
     return output
 
 
@@ -101,8 +110,9 @@ def convert_rows(path):
 
     for expected, (line_number, record) in enumerate(load_jsonl(path)):
         validate_sequence(path, line_number, record, expected)
-        native_rows = numeric_value(path, line_number, record, "native_rows")
-        output.append(f"{native_rows:.17g}\n")
+        field = "effective_rows" if "effective_rows" in record else "native_rows"
+        rows = numeric_value(path, line_number, record, field)
+        output.append(f"{rows:.17g}\n")
     return output
 
 
@@ -160,7 +170,7 @@ def main():
     write_atomic(costs_output, costs)
     write_atomic(rows_output, rows)
 
-    print(f"wrote {len(costs)} costs to {costs_output}")
+    print(f"initialized sparse costs file at {costs_output}")
     print(f"wrote {len(rows)} rows to {rows_output}")
 
 

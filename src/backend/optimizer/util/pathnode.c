@@ -4380,6 +4380,9 @@ reparameterize_path(PlannerInfo *root, Path *path,
 				 * the cost estimate.
 				 */
 				memcpy(newpath, ipath, sizeof(IndexPath));
+				newpath->path.plan_replay_path_id_valid = false;
+				newpath->path.plan_replay_path_id_hi = 0;
+				newpath->path.plan_replay_path_id_lo = 0;
 				newpath->path.param_info =
 					get_baserel_parampathinfo(root, rel, required_outer);
 				cost_index(newpath, root, loop_count, false);

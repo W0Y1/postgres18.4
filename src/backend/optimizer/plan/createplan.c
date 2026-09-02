@@ -5522,6 +5522,9 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->parallel_safe = src->parallel_safe;
 	dest->plan_replay_path_sequence_valid = src->plan_replay_path_sequence_valid;
 	dest->plan_replay_path_sequence = src->plan_replay_path_sequence;
+	dest->plan_replay_path_id_valid = src->plan_replay_path_id_valid;
+	dest->plan_replay_path_id_hi = src->plan_replay_path_id_hi;
+	dest->plan_replay_path_id_lo = src->plan_replay_path_id_lo;
 	dest->plan_replay_cardinality_sequence_valid =
 		src->plan_replay_cardinality_sequence_valid;
 	dest->plan_replay_cardinality_sequence =

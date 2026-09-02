@@ -5,6 +5,8 @@
 #include <math.h>
 
 #include "commands/dbcommands.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -20,6 +22,7 @@
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
@@ -39,7 +42,42 @@ typedef enum PlanReplayMode
 	PLAN_REPLAY_MODE_REPLAY
 } PlanReplayMode;
 
+typedef enum PlanReplayChannelMode
+{
+	PLAN_REPLAY_CHANNEL_INHERIT,
+	PLAN_REPLAY_CHANNEL_OFF,
+	PLAN_REPLAY_CHANNEL_CAPTURE,
+	PLAN_REPLAY_CHANNEL_REPLAY,
+	PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY
+} PlanReplayChannelMode;
+
+#define PLAN_REPLAY_PATH_ID_BYTES 16
+#define PLAN_REPLAY_PATH_ID_HEX_LENGTH (PLAN_REPLAY_PATH_ID_BYTES * 2)
+#define PLAN_REPLAY_COST_LINE_MAX 256
+
+typedef struct PlanReplayPathId
+{
+	uint64		hi;
+	uint64		lo;
+} PlanReplayPathId;
+
+typedef struct PlanReplayIdentityEntry
+{
+	PlanReplayPathId id;
+	char	   *descriptor;
+} PlanReplayIdentityEntry;
+
+typedef struct PlanReplayCostEntry
+{
+	PlanReplayPathId id;
+	Cost		startup_cost;
+	Cost		total_cost;
+	bool		matched;
+} PlanReplayCostEntry;
+
 static int plan_replay_mode = PLAN_REPLAY_MODE_OFF;
+static int plan_replay_path_mode = PLAN_REPLAY_CHANNEL_INHERIT;
+static int plan_replay_cardinality_mode = PLAN_REPLAY_CHANNEL_INHERIT;
 static char *plan_replay_path_capture_file = NULL;
 static char *plan_replay_path_replay_file = NULL;
 static bool plan_replay_path_capture_verbose = false;
@@ -51,8 +89,10 @@ static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
 static set_join_pathlist_hook_type previous_set_join_pathlist_hook = NULL;
 static cardinality_estimate_hook_type previous_cardinality_estimate_hook = NULL;
 
-static FILE *plan_replay_path_file = NULL;
-static FILE *plan_replay_cardinality_file = NULL;
+static FILE *plan_replay_path_capture_stream = NULL;
+static FILE *plan_replay_path_replay_stream = NULL;
+static FILE *plan_replay_cardinality_capture_stream = NULL;
+static FILE *plan_replay_cardinality_replay_stream = NULL;
 static PlannerInfo *plan_replay_planner_root = NULL;
 static Query *plan_replay_query = NULL;
 static const char *plan_replay_query_string = NULL;
@@ -62,12 +102,30 @@ static uint64 plan_replay_batch_count = 0;
 static uint64 plan_replay_last_path_count = 0;
 static uint64 plan_replay_last_batch_count = 0;
 static uint64 plan_replay_cardinality_sequence = 0;
+static uint64 plan_replay_cost_replay_entry_count = 0;
+static uint64 plan_replay_cost_replay_applied_count = 0;
+static uint64 plan_replay_cost_replay_matched_entry_count = 0;
+static uint64 plan_replay_last_cost_replay_entry_count = 0;
+static uint64 plan_replay_last_cost_replay_applied_count = 0;
+static uint64 plan_replay_last_cost_replay_unmatched_count = 0;
 static int plan_replay_planner_depth = 0;
+static HTAB *plan_replay_identity_table = NULL;
+static HTAB *plan_replay_cost_table = NULL;
+
 
 static const struct config_enum_entry plan_replay_mode_options[] = {
 	{"off", PLAN_REPLAY_MODE_OFF, false},
 	{"capture", PLAN_REPLAY_MODE_CAPTURE, false},
 	{"replay", PLAN_REPLAY_MODE_REPLAY, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry plan_replay_channel_mode_options[] = {
+	{"inherit", PLAN_REPLAY_CHANNEL_INHERIT, false},
+	{"off", PLAN_REPLAY_CHANNEL_OFF, false},
+	{"capture", PLAN_REPLAY_CHANNEL_CAPTURE, false},
+	{"replay", PLAN_REPLAY_CHANNEL_REPLAY, false},
+	{"capture_replay", PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY, false},
 	{NULL, 0, false}
 };
 
@@ -77,6 +135,12 @@ static const char *plan_replay_join_type_name(JoinType jointype);
 static void plan_replay_append_path_json(StringInfo output, Path *path);
 static void plan_replay_append_compact_path_json(StringInfo output, Path *path);
 static void plan_replay_append_verbose_path_json(StringInfo output, Path *path);
+static PlanReplayPathId plan_replay_compute_path_id(Path *path);
+static void plan_replay_format_path_id(PlanReplayPathId id, char *output);
+static void plan_replay_load_costs(void);
+static int plan_replay_effective_channel_mode(int channel_mode);
+static bool plan_replay_mode_captures(int mode);
+static bool plan_replay_mode_replays(int mode);
 static bool plan_replay_is_active(void);
 static void plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial);
 static Cardinality plan_replay_cardinality_estimate(PlannerInfo *root,
@@ -90,7 +154,39 @@ static Cardinality plan_replay_cardinality_estimate(PlannerInfo *root,
 															Cardinality inner_rows,
 															Cardinality native_rows,
 															bool *sequence_valid,
-															uint64 *sequence);
+																	uint64 *sequence);
+
+static int
+plan_replay_effective_channel_mode(int channel_mode)
+{
+	if (channel_mode != PLAN_REPLAY_CHANNEL_INHERIT)
+		return channel_mode;
+
+	switch (plan_replay_mode)
+	{
+		case PLAN_REPLAY_MODE_OFF:
+			return PLAN_REPLAY_CHANNEL_OFF;
+		case PLAN_REPLAY_MODE_CAPTURE:
+			return PLAN_REPLAY_CHANNEL_CAPTURE;
+		case PLAN_REPLAY_MODE_REPLAY:
+			return PLAN_REPLAY_CHANNEL_REPLAY;
+	}
+	return PLAN_REPLAY_CHANNEL_OFF;
+}
+
+static bool
+plan_replay_mode_captures(int mode)
+{
+	return mode == PLAN_REPLAY_CHANNEL_CAPTURE ||
+		mode == PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY;
+}
+
+static bool
+plan_replay_mode_replays(int mode)
+{
+	return mode == PLAN_REPLAY_CHANNEL_REPLAY ||
+		mode == PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY;
+}
 
 static const char *
 plan_replay_operator_name(Path *path)
@@ -1341,25 +1437,598 @@ plan_replay_append_path_json(StringInfo output, Path *path)
 		plan_replay_append_compact_path_json(output, path);
 }
 
+static int
+plan_replay_string_compare(const void *left, const void *right)
+{
+	const char *const *left_string = (const char *const *) left;
+	const char *const *right_string = (const char *const *) right;
+
+	return strcmp(*left_string, *right_string);
+}
+
+static int
+plan_replay_path_id_compare(const void *left, const void *right)
+{
+	const PlanReplayPathId *left_id = (const PlanReplayPathId *) left;
+	const PlanReplayPathId *right_id = (const PlanReplayPathId *) right;
+
+	if (left_id->hi < right_id->hi)
+		return -1;
+	if (left_id->hi > right_id->hi)
+		return 1;
+	if (left_id->lo < right_id->lo)
+		return -1;
+	if (left_id->lo > right_id->lo)
+		return 1;
+	return 0;
+}
+
 static void
-plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial)
+plan_replay_append_descriptor_node(StringInfo output, const char *name,
+								   const void *node)
+{
+	char *value = nodeToString(node);
+
+	appendStringInfo(output, "|%s=%zu:", name, strlen(value));
+	appendStringInfoString(output, value);
+	pfree(value);
+}
+
+static void
+plan_replay_append_descriptor_relations(StringInfo output, Relids relids)
+{
+	int rti = -1;
+
+	appendStringInfoString(output, "|relations=[");
+	while ((rti = bms_next_member(relids, rti)) >= 0)
+	{
+		RangeTblEntry *rte;
+
+		if (plan_replay_planner_root == NULL ||
+			rti <= 0 || rti >= plan_replay_planner_root->simple_rel_array_size)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("cannot identify relation %d for stable Path ID", rti)));
+		rte = planner_rt_fetch(rti, plan_replay_planner_root);
+		appendStringInfo(output, "%d:%d:%u;", rti, (int) rte->rtekind,
+						 rte->rtekind == RTE_RELATION ? rte->relid : InvalidOid);
+	}
+	appendStringInfoChar(output, ']');
+}
+
+static void
+plan_replay_append_descriptor_clause_set(StringInfo output, const char *name,
+									 List *clauses, bool restrict_infos)
+{
+	int count = list_length(clauses);
+	char **values;
+	ListCell *cell;
+	int index = 0;
+
+	if (count == 0)
+	{
+		appendStringInfo(output, "|%s=[]", name);
+		return;
+	}
+	values = palloc(sizeof(char *) * count);
+	foreach(cell, clauses)
+	{
+		Node *node = (Node *) lfirst(cell);
+
+		if (restrict_infos)
+		{
+			if (!IsA(node, RestrictInfo))
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("expected RestrictInfo while building stable Path ID")));
+			node = (Node *) ((RestrictInfo *) node)->clause;
+		}
+		values[index++] = nodeToString(node);
+	}
+	qsort(values, count, sizeof(char *), plan_replay_string_compare);
+	appendStringInfo(output, "|%s=[", name);
+	for (index = 0; index < count; index++)
+	{
+		appendStringInfo(output, "%zu:", strlen(values[index]));
+		appendStringInfoString(output, values[index]);
+		appendStringInfoChar(output, ';');
+		pfree(values[index]);
+	}
+	appendStringInfoChar(output, ']');
+	pfree(values);
+}
+
+static void
+plan_replay_append_descriptor_index_clauses(StringInfo output, List *clauses)
+{
+	int count = list_length(clauses);
+	char **values;
+	ListCell *cell;
+	int index = 0;
+
+	if (count == 0)
+	{
+		appendStringInfoString(output, "|index_clauses=[]");
+		return;
+	}
+	values = palloc(sizeof(char *) * count);
+	foreach(cell, clauses)
+	{
+		IndexClause *clause = (IndexClause *) lfirst(cell);
+		StringInfoData value;
+
+		if (!IsA(clause, IndexClause))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("expected IndexClause while building stable Path ID")));
+		initStringInfo(&value);
+		appendStringInfo(&value, "col=%d|lossy=%d", clause->indexcol,
+						 clause->lossy ? 1 : 0);
+		plan_replay_append_descriptor_node(&value, "indexcols", clause->indexcols);
+		plan_replay_append_descriptor_node(&value, "clause", clause->rinfo->clause);
+		plan_replay_append_descriptor_clause_set(&value, "indexquals",
+											 clause->indexquals, true);
+		values[index++] = value.data;
+	}
+	qsort(values, count, sizeof(char *), plan_replay_string_compare);
+	appendStringInfoString(output, "|index_clauses=[");
+	for (index = 0; index < count; index++)
+	{
+		appendStringInfo(output, "%zu:", strlen(values[index]));
+		appendStringInfoString(output, values[index]);
+		appendStringInfoChar(output, ';');
+		pfree(values[index]);
+	}
+	appendStringInfoChar(output, ']');
+	pfree(values);
+}
+
+static void
+plan_replay_format_path_id(PlanReplayPathId id, char *output)
+{
+	snprintf(output, PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1,
+			 "%016" PRIx64 "%016" PRIx64, id.hi, id.lo);
+}
+
+static PlanReplayPathId
+plan_replay_hash_descriptor(const char *descriptor)
+{
+	pg_cryptohash_ctx *context;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH];
+	PlanReplayPathId id = {0, 0};
+	int index;
+
+	context = pg_cryptohash_create(PG_SHA256);
+	if (context == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not create SHA-256 context for stable Path ID")));
+	if (pg_cryptohash_init(context) < 0 ||
+		pg_cryptohash_update(context, (const uint8 *) descriptor,
+							 strlen(descriptor)) < 0 ||
+		pg_cryptohash_final(context, digest, sizeof(digest)) < 0)
+	{
+		char *message = pstrdup(pg_cryptohash_error(context));
+
+		pg_cryptohash_free(context);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not hash stable Path descriptor: %s", message)));
+	}
+	pg_cryptohash_free(context);
+	for (index = 0; index < 8; index++)
+		id.hi = (id.hi << 8) | digest[index];
+	for (index = 8; index < PLAN_REPLAY_PATH_ID_BYTES; index++)
+		id.lo = (id.lo << 8) | digest[index];
+	return id;
+}
+
+static void
+plan_replay_register_descriptor(PlanReplayPathId id, const char *descriptor)
+{
+	PlanReplayIdentityEntry *entry;
+	bool found;
+
+	entry = hash_search(plan_replay_identity_table, &id, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->descriptor = pstrdup(descriptor);
+		return;
+	}
+	if (strcmp(entry->descriptor, descriptor) != 0)
+	{
+		char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+		plan_replay_format_path_id(id, path_id);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("stable Path ID collision for %s", path_id),
+				 errdetail("Two different canonical Path descriptors produced the same 128-bit ID.")));
+	}
+}
+
+static PlanReplayPathId
+plan_replay_child_path_id(Path *child)
+{
+	if (child == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("stable Path ID requires a non-null child Path")));
+	return plan_replay_compute_path_id(child);
+}
+
+static void
+plan_replay_append_descriptor_child(StringInfo output, const char *name,
+								Path *child)
+{
+	PlanReplayPathId id = plan_replay_child_path_id(child);
+	char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+	plan_replay_format_path_id(id, path_id);
+	appendStringInfo(output, "|%s=%s", name, path_id);
+}
+
+static void
+plan_replay_append_descriptor_bitmap_children(StringInfo output, List *children)
+{
+	int count = list_length(children);
+	PlanReplayPathId *ids;
+	ListCell *cell;
+	int index = 0;
+
+	ids = palloc(sizeof(PlanReplayPathId) * Max(count, 1));
+	foreach(cell, children)
+		ids[index++] = plan_replay_child_path_id((Path *) lfirst(cell));
+	qsort(ids, count, sizeof(PlanReplayPathId), plan_replay_path_id_compare);
+	appendStringInfoString(output, "|bitmap_children=[");
+	for (index = 0; index < count; index++)
+	{
+		char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+		plan_replay_format_path_id(ids[index], path_id);
+		appendStringInfo(output, "%s;", path_id);
+	}
+	appendStringInfoChar(output, ']');
+	pfree(ids);
+}
+
+static void
+plan_replay_append_descriptor_append_children(StringInfo output, AppendPath *append)
+{
+	ListCell *cell;
+	appendStringInfoString(output, "|append_children=[");
+	foreach(cell, append->subpaths)
+	{
+		PlanReplayPathId id = plan_replay_child_path_id((Path *) lfirst(cell));
+		char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+		plan_replay_format_path_id(id, path_id);
+		appendStringInfo(output, "%s;", path_id);
+	}
+	appendStringInfoChar(output, ']');
+}
+
+static void
+plan_replay_append_descriptor_path_list(StringInfo output, const char *name,
+								List *children)
+{
+	ListCell *cell;
+
+	appendStringInfo(output, "|%s=[", name);
+	foreach(cell, children)
+	{
+		PlanReplayPathId id = plan_replay_child_path_id((Path *) lfirst(cell));
+		char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+		plan_replay_format_path_id(id, path_id);
+		appendStringInfo(output, "%s;", path_id);
+	}
+	appendStringInfoChar(output, ']');
+}
+
+static void
+plan_replay_append_descriptor_target_sortgrouprefs(StringInfo output,
+												PathTarget *target)
+{
+	int count = list_length(target->exprs);
+	int index;
+
+	appendStringInfoString(output, "|target_sortgrouprefs=[");
+	for (index = 0; index < count; index++)
+		appendStringInfo(output, "%u;",
+						 target->sortgrouprefs != NULL ?
+						 target->sortgrouprefs[index] : 0);
+	appendStringInfoChar(output, ']');
+}
+
+static void
+plan_replay_append_path_descriptor(StringInfo output, Path *path)
+{
+	Relids required_outer = PATH_REQ_OUTER(path);
+	Relids parent_relids = path->parent != NULL ? path->parent->relids : NULL;
+
+	if (nodeTag(path) == T_Path && path->pathtype != T_SeqScan)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Path type %s is not supported by stable Path ID format 1",
+						plan_replay_path_node_name(path)),
+				 errdetail("Cost capture and replay fail closed instead of falling back to sequence matching.")));
+
+	appendStringInfo(output,
+				 "pg_plan_replay_path_id_v1|node_tag=%d|pathtype=%d"
+				 "|parallel_aware=%d|parallel_safe=%d|parallel_workers=%d",
+				 (int) nodeTag(path), (int) path->pathtype,
+				 path->parallel_aware ? 1 : 0, path->parallel_safe ? 1 : 0,
+				 path->parallel_workers);
+	appendStringInfoString(output, "|parent_relids=");
+	plan_replay_append_relids(output, parent_relids);
+	plan_replay_append_descriptor_relations(output, parent_relids);
+	appendStringInfoString(output, "|required_outer=");
+	plan_replay_append_relids(output, required_outer);
+	plan_replay_append_descriptor_node(output, "pathkeys", path->pathkeys);
+	if (path->parent != NULL && path->parent->relid > 0)
+		plan_replay_append_descriptor_clause_set(output, "base_restrictions",
+											 path->parent->baserestrictinfo, true);
+	if (path->pathtarget != NULL)
+	{
+		plan_replay_append_descriptor_node(output, "target_exprs",
+									  path->pathtarget->exprs);
+		plan_replay_append_descriptor_target_sortgrouprefs(output,
+													 path->pathtarget);
+	}
+	else
+		appendStringInfoString(output, "|target=null");
+
+	switch (nodeTag(path))
+	{
+		case T_Path:
+			break;
+		case T_IndexPath:
+		{
+			IndexPath *index_path = (IndexPath *) path;
+
+			if (index_path->indexinfo == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("IndexPath has no index while building stable Path ID")));
+			appendStringInfo(output, "|index_oid=%u|scan_direction=%d",
+							 index_path->indexinfo->indexoid,
+							 (int) index_path->indexscandir);
+			plan_replay_append_descriptor_index_clauses(output,
+												 index_path->indexclauses);
+			plan_replay_append_descriptor_node(output, "index_orderbys",
+										  index_path->indexorderbys);
+			plan_replay_append_descriptor_node(output, "index_orderbycols",
+										  index_path->indexorderbycols);
+			break;
+		}
+		case T_BitmapHeapPath:
+			plan_replay_append_descriptor_child(output, "bitmapqual",
+										((BitmapHeapPath *) path)->bitmapqual);
+			break;
+		case T_BitmapAndPath:
+			plan_replay_append_descriptor_bitmap_children(output,
+												((BitmapAndPath *) path)->bitmapquals);
+			break;
+		case T_BitmapOrPath:
+			plan_replay_append_descriptor_bitmap_children(output,
+												((BitmapOrPath *) path)->bitmapquals);
+			break;
+		case T_AppendPath:
+			plan_replay_append_descriptor_append_children(output,
+												(AppendPath *) path);
+			break;
+		case T_MergeAppendPath:
+			plan_replay_append_descriptor_path_list(output, "merge_append_children",
+											 ((MergeAppendPath *) path)->subpaths);
+			break;
+		case T_GroupResultPath:
+			plan_replay_append_descriptor_clause_set(output, "quals",
+											 ((GroupResultPath *) path)->quals, false);
+			break;
+		case T_MaterialPath:
+			plan_replay_append_descriptor_child(output, "subpath",
+										((MaterialPath *) path)->subpath);
+			break;
+		case T_MemoizePath:
+		{
+			MemoizePath *memoize = (MemoizePath *) path;
+
+			appendStringInfo(output, "|single_row=%d|binary_mode=%d",
+							 memoize->singlerow ? 1 : 0,
+							 memoize->binary_mode ? 1 : 0);
+			plan_replay_append_descriptor_node(output, "hash_operators",
+										  memoize->hash_operators);
+			plan_replay_append_descriptor_node(output, "parameter_exprs",
+										  memoize->param_exprs);
+			plan_replay_append_descriptor_child(output, "subpath",
+										memoize->subpath);
+			break;
+		}
+		case T_UniquePath:
+		{
+			UniquePath *unique = (UniquePath *) path;
+
+			appendStringInfo(output, "|unique_method=%d", (int) unique->umethod);
+			plan_replay_append_descriptor_node(output, "unique_operators",
+										  unique->in_operators);
+			plan_replay_append_descriptor_node(output, "unique_exprs",
+										  unique->uniq_exprs);
+			plan_replay_append_descriptor_child(output, "subpath",
+										unique->subpath);
+			break;
+		}
+		case T_GatherPath:
+		{
+			GatherPath *gather = (GatherPath *) path;
+
+			appendStringInfo(output, "|single_copy=%d|workers=%d",
+							 gather->single_copy ? 1 : 0, gather->num_workers);
+			plan_replay_append_descriptor_child(output, "subpath",
+										gather->subpath);
+			break;
+		}
+		case T_GatherMergePath:
+		{
+			GatherMergePath *gather = (GatherMergePath *) path;
+
+			appendStringInfo(output, "|workers=%d", gather->num_workers);
+			plan_replay_append_descriptor_child(output, "subpath",
+										gather->subpath);
+			break;
+		}
+		case T_NestPath:
+		case T_MergePath:
+		case T_HashPath:
+		{
+			JoinPath *join = (JoinPath *) path;
+
+			appendStringInfo(output, "|join_type=%d|inner_unique=%d",
+							 (int) join->jointype, join->inner_unique ? 1 : 0);
+			plan_replay_append_descriptor_clause_set(output, "join_clauses",
+											 join->joinrestrictinfo, true);
+			if (IsA(path, MergePath))
+			{
+				MergePath *merge = (MergePath *) path;
+
+				plan_replay_append_descriptor_clause_set(output, "merge_clauses",
+												 merge->path_mergeclauses, true);
+				plan_replay_append_descriptor_node(output, "outer_sortkeys",
+											  merge->outersortkeys);
+				plan_replay_append_descriptor_node(output, "inner_sortkeys",
+											  merge->innersortkeys);
+				appendStringInfo(output,
+							 "|outer_presorted=%d|skip_mark_restore=%d|materialize_inner=%d",
+							 merge->outer_presorted_keys,
+							 merge->skip_mark_restore ? 1 : 0,
+							 merge->materialize_inner ? 1 : 0);
+			}
+			else if (IsA(path, HashPath))
+				plan_replay_append_descriptor_clause_set(output, "hash_clauses",
+												 ((HashPath *) path)->path_hashclauses,
+												 true);
+			plan_replay_append_descriptor_child(output, "outer",
+										join->outerjoinpath);
+			plan_replay_append_descriptor_child(output, "inner",
+										join->innerjoinpath);
+			break;
+		}
+		case T_ProjectionPath:
+			appendStringInfo(output, "|dummy=%d",
+							 ((ProjectionPath *) path)->dummypp ? 1 : 0);
+			plan_replay_append_descriptor_child(output, "subpath",
+										((ProjectionPath *) path)->subpath);
+			break;
+		case T_SortPath:
+			plan_replay_append_descriptor_child(output, "subpath",
+										((SortPath *) path)->subpath);
+			break;
+		case T_IncrementalSortPath:
+			appendStringInfo(output, "|presorted_columns=%d",
+							 ((IncrementalSortPath *) path)->nPresortedCols);
+			plan_replay_append_descriptor_child(output, "subpath",
+										((SortPath *) path)->subpath);
+			break;
+		case T_GroupPath:
+			plan_replay_append_descriptor_node(output, "group_clause",
+										  ((GroupPath *) path)->groupClause);
+			plan_replay_append_descriptor_clause_set(output, "having_quals",
+											 ((GroupPath *) path)->qual, false);
+			plan_replay_append_descriptor_child(output, "subpath",
+										((GroupPath *) path)->subpath);
+			break;
+		case T_UpperUniquePath:
+			appendStringInfo(output, "|keys=%d",
+							 ((UpperUniquePath *) path)->numkeys);
+			plan_replay_append_descriptor_child(output, "subpath",
+										((UpperUniquePath *) path)->subpath);
+			break;
+		case T_AggPath:
+		{
+			AggPath *agg = (AggPath *) path;
+
+			appendStringInfo(output, "|strategy=%d|split=%d",
+							 (int) agg->aggstrategy, (int) agg->aggsplit);
+			plan_replay_append_descriptor_node(output, "group_clause",
+										  agg->groupClause);
+			plan_replay_append_descriptor_clause_set(output, "having_quals",
+											 agg->qual, false);
+			plan_replay_append_descriptor_child(output, "subpath",
+										agg->subpath);
+			break;
+		}
+		case T_LimitPath:
+		{
+			LimitPath *limit = (LimitPath *) path;
+
+			appendStringInfo(output, "|limit_option=%d", (int) limit->limitOption);
+			plan_replay_append_descriptor_node(output, "limit_offset",
+										  limit->limitOffset);
+			plan_replay_append_descriptor_node(output, "limit_count",
+										  limit->limitCount);
+			plan_replay_append_descriptor_child(output, "subpath",
+										limit->subpath);
+			break;
+		}
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Path type %s is not supported by stable Path ID format 1",
+							plan_replay_path_node_name(path)),
+					 errdetail("Cost capture and replay fail closed instead of falling back to sequence matching.")));
+	}
+}
+
+static PlanReplayPathId
+plan_replay_compute_path_id(Path *path)
+{
+	StringInfoData descriptor;
+	PlanReplayPathId id;
+
+	if (path->plan_replay_path_id_valid)
+	{
+		id.hi = path->plan_replay_path_id_hi;
+		id.lo = path->plan_replay_path_id_lo;
+		return id;
+	}
+	initStringInfo(&descriptor);
+	plan_replay_append_path_descriptor(&descriptor, path);
+	id = plan_replay_hash_descriptor(descriptor.data);
+	plan_replay_register_descriptor(id, descriptor.data);
+	path->plan_replay_path_id_valid = true;
+	path->plan_replay_path_id_hi = id.hi;
+	path->plan_replay_path_id_lo = id.lo;
+	pfree(descriptor.data);
+	return id;
+}
+
+static void
+plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial,
+					 Cost native_startup_cost, Cost native_total_cost,
+					 bool replay_applied)
 {
 	StringInfoData line;
+	PlanReplayPathId id;
+	char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
 	size_t written;
 	char *database_name = NULL;
 	char *user_name = NULL;
 
 	initStringInfo(&line);
+	Assert(path->plan_replay_path_id_valid);
+	id.hi = path->plan_replay_path_id_hi;
+	id.lo = path->plan_replay_path_id_lo;
+	plan_replay_format_path_id(id, path_id);
 	if (!plan_replay_path_capture_verbose)
 		appendStringInfo(&line,
-						 "{\"format_version\":3,\"sequence\":" UINT64_FORMAT,
+						 "{\"format_version\":5,\"sequence\":" UINT64_FORMAT,
 						 plan_replay_path_sequence);
 	else
 	{
 		database_name = get_database_name(MyDatabaseId);
 		user_name = GetUserNameFromId(GetUserId(), false);
 		appendStringInfo(&line, "{\"sequence\":" UINT64_FORMAT
-						 ",\"format_version\":2,\"server_version_num\":%d,"
+						 ",\"format_version\":3,\"server_version_num\":%d,"
 						 "\"query_id\":" INT64_FORMAT ",\"command_type\":%d,"
 						 "\"cursor_options\":%d,\"database\":",
 						 plan_replay_path_sequence, PG_VERSION_NUM,
@@ -1385,6 +2054,13 @@ plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial)
 		appendStringInfoString(&line, ",\"planner_settings\":");
 		plan_replay_append_planner_settings(&line);
 	}
+	appendStringInfoString(&line, ",\"path_id\":");
+	escape_json(&line, path_id);
+	appendStringInfo(&line,
+					 ",\"cost_replay_applied\":%s,"
+					 "\"native_startup_cost\":%.17g,\"native_total_cost\":%.17g",
+					 replay_applied ? "true" : "false",
+					 native_startup_cost, native_total_cost);
 	appendStringInfoString(&line, ",\"cardinality_sequence\":");
 	if (path->plan_replay_cardinality_sequence_valid)
 		appendStringInfo(&line, UINT64_FORMAT,
@@ -1398,7 +2074,7 @@ plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial)
 	plan_replay_append_path_json(&line, path);
 	appendStringInfoString(&line, "}\n");
 
-	written = fwrite(line.data, 1, line.len, plan_replay_path_file);
+	written = fwrite(line.data, 1, line.len, plan_replay_path_capture_stream);
 	if (written != (size_t) line.len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1410,70 +2086,182 @@ plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial)
 	pfree(line.data);
 }
 
-static void
-plan_replay_replay_path(Path *path)
+static int
+plan_replay_hex_value(char value)
 {
-	char line[256];
-	char *cursor;
-	char *end;
-	double startup_cost;
-	double total_cost;
+	if (value >= '0' && value <= '9')
+		return value - '0';
+	if (value >= 'a' && value <= 'f')
+		return value - 'a' + 10;
+	if (value >= 'A' && value <= 'F')
+		return value - 'A' + 10;
+	return -1;
+}
 
-	if (fgets(line, sizeof(line), plan_replay_path_file) == NULL)
+static bool
+plan_replay_parse_path_id(const char *text, PlanReplayPathId *id)
+{
+	int index;
+
+	id->hi = 0;
+	id->lo = 0;
+	for (index = 0; index < PLAN_REPLAY_PATH_ID_HEX_LENGTH; index++)
 	{
-		if (ferror(plan_replay_path_file))
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not read pg_plan_replay replay file: %m")));
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("pg_plan_replay replay file ended before Path " UINT64_FORMAT,
-						plan_replay_path_sequence),
-				 errdetail("Expected costs for operator %s.", plan_replay_operator_name(path))));
+		int value = plan_replay_hex_value(text[index]);
+
+		if (value < 0)
+			return false;
+		if (index < 16)
+			id->hi = (id->hi << 4) | value;
+		else
+			id->lo = (id->lo << 4) | value;
 	}
-	if (strchr(line, '\n') == NULL && !feof(plan_replay_path_file))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("pg_plan_replay replay line " UINT64_FORMAT " is too long",
-						plan_replay_path_sequence)));
+	return text[PLAN_REPLAY_PATH_ID_HEX_LENGTH] == '\0' ||
+		isspace((unsigned char) text[PLAN_REPLAY_PATH_ID_HEX_LENGTH]);
+}
 
-	cursor = line;
-	errno = 0;
-	startup_cost = strtod(cursor, &end);
-	if (cursor == end || errno == ERANGE)
-		goto invalid_line;
-	cursor = end;
+static void
+plan_replay_load_costs(void)
+{
+	char line[PLAN_REPLAY_COST_LINE_MAX];
+	uint64 line_number = 0;
+	bool header_seen = false;
 
-	errno = 0;
-	total_cost = strtod(cursor, &end);
-	if (cursor == end || errno == ERANGE)
-		goto invalid_line;
-	cursor = end;
-	while (*cursor != '\0' && isspace((unsigned char) *cursor))
-		cursor++;
-	if (*cursor != '\0')
-		goto invalid_line;
+	Assert(plan_replay_path_replay_stream != NULL);
+	Assert(plan_replay_cost_table != NULL);
+	while (fgets(line, sizeof(line), plan_replay_path_replay_stream) != NULL)
+	{
+		char *cursor = line;
+		char *end;
+		PlanReplayPathId id;
+		PlanReplayCostEntry *entry;
+		double startup_cost;
+		double total_cost;
+		bool found;
 
-	if (!isfinite(startup_cost) || !isfinite(total_cost) ||
-		startup_cost < 0.0 || total_cost < 0.0 ||
-		startup_cost > total_cost)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("invalid pg_plan_replay costs at Path " UINT64_FORMAT,
-						plan_replay_path_sequence),
-				 errdetail("Operator %s requires finite nonnegative costs with startup_cost <= total_cost.",
-						   plan_replay_operator_name(path))));
+		line_number++;
+		if (strchr(line, '\n') == NULL && !feof(plan_replay_path_replay_stream))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("pg_plan_replay cost replay line " UINT64_FORMAT " is too long",
+							line_number)));
+		while (*cursor != '\0' && isspace((unsigned char) *cursor))
+			cursor++;
+		if (*cursor == '#')
+		{
+			char *newline = strchr(cursor, '\n');
 
-	path->startup_cost = startup_cost;
-	path->total_cost = total_cost;
-	return;
+			if (newline != NULL)
+				*newline = '\0';
+			if (strcmp(cursor, "# pg_plan_replay_costs format=2") != 0 ||
+				header_seen || line_number != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("invalid pg_plan_replay cost replay header at line "
+								UINT64_FORMAT, line_number),
+						 errdetail("Expected exactly: # pg_plan_replay_costs format=2")));
+			header_seen = true;
+			continue;
+		}
+		if (*cursor == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("empty pg_plan_replay cost replay line " UINT64_FORMAT,
+							line_number)));
+		if (!header_seen)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("pg_plan_replay cost replay file has no format 2 header"),
+					 errhint("Regenerate the sparse .costs file; sequence-based files are not supported.")));
+
+		if (strlen(cursor) < PLAN_REPLAY_PATH_ID_HEX_LENGTH ||
+			!plan_replay_parse_path_id(cursor, &id))
+			goto invalid_line;
+		cursor += PLAN_REPLAY_PATH_ID_HEX_LENGTH;
+		if (!isspace((unsigned char) *cursor))
+			goto invalid_line;
+		while (isspace((unsigned char) *cursor))
+			cursor++;
+
+		errno = 0;
+		startup_cost = strtod(cursor, &end);
+		if (cursor == end || errno == ERANGE)
+			goto invalid_line;
+		cursor = end;
+		errno = 0;
+		total_cost = strtod(cursor, &end);
+		if (cursor == end || errno == ERANGE)
+			goto invalid_line;
+		cursor = end;
+		while (*cursor != '\0' && isspace((unsigned char) *cursor))
+			cursor++;
+		if (*cursor != '\0')
+			goto invalid_line;
+		if (!isfinite(startup_cost) || !isfinite(total_cost) ||
+			startup_cost < 0.0 || total_cost < 0.0 ||
+			startup_cost > total_cost)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("invalid pg_plan_replay costs at line " UINT64_FORMAT,
+							line_number),
+					 errdetail("Costs must be finite and nonnegative with startup_cost <= total_cost.")));
+
+		entry = hash_search(plan_replay_cost_table, &id, HASH_ENTER, &found);
+		if (found)
+		{
+			char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
+
+			plan_replay_format_path_id(id, path_id);
+			ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("duplicate stable Path ID %s in cost replay file", path_id)));
+		}
+		entry->startup_cost = startup_cost;
+		entry->total_cost = total_cost;
+		entry->matched = false;
+		plan_replay_cost_replay_entry_count++;
+		continue;
 
 invalid_line:
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_EXCEPTION),
-			 errmsg("malformed pg_plan_replay replay line for Path " UINT64_FORMAT,
-					plan_replay_path_sequence),
-				 errdetail("Expected exactly: startup_cost total_cost")));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("malformed pg_plan_replay cost replay line " UINT64_FORMAT,
+						line_number),
+				 errdetail("Expected exactly: 32_hex_path_id startup_cost total_cost")));
+	}
+	if (ferror(plan_replay_path_replay_stream))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read pg_plan_replay Path replay file: %m")));
+	if (!header_seen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("pg_plan_replay cost replay file is empty"),
+				 errdetail("Expected header: # pg_plan_replay_costs format=2")));
+}
+
+static bool
+plan_replay_replay_path(Path *path)
+{
+	PlanReplayPathId id;
+	PlanReplayCostEntry *entry;
+
+	Assert(path->plan_replay_path_id_valid);
+	id.hi = path->plan_replay_path_id_hi;
+	id.lo = path->plan_replay_path_id_lo;
+	entry = hash_search(plan_replay_cost_table, &id, HASH_FIND, NULL);
+	if (entry == NULL)
+		return false;
+
+	path->startup_cost = entry->startup_cost;
+	path->total_cost = entry->total_cost;
+	if (!entry->matched)
+	{
+		entry->matched = true;
+		plan_replay_cost_replay_matched_entry_count++;
+	}
+	plan_replay_cost_replay_applied_count++;
+	return true;
 }
 
 static const char *
@@ -1513,20 +2301,23 @@ plan_replay_capture_cardinality(PlannerInfo *root, CardinalityEstimateKind kind,
 						RelOptInfo *rel, RelOptInfo *outer_rel,
 						RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
 						List *restrictlist, Cardinality outer_rows,
-						Cardinality inner_rows, Cardinality native_rows)
+						Cardinality inner_rows, Cardinality native_rows,
+						Cardinality effective_rows)
 {
 	StringInfoData line;
 	size_t written;
 
 	initStringInfo(&line);
 	appendStringInfo(&line,
-					 "{\"format_version\":1,\"sequence\":" UINT64_FORMAT
+					 "{\"format_version\":2,\"sequence\":" UINT64_FORMAT
 					 ",\"kind\":",
 					 plan_replay_cardinality_sequence);
 	escape_json(&line, plan_replay_cardinality_kind_name(kind));
 	appendStringInfo(&line,
-					 ",\"native_rows\":%.17g,\"width\":%d,\"relids\":",
-					 native_rows, rel->reltarget != NULL ? rel->reltarget->width : 0);
+					 ",\"native_rows\":%.17g,\"effective_rows\":%.17g,"
+					 "\"width\":%d,\"relids\":",
+					 native_rows, effective_rows,
+					 rel->reltarget != NULL ? rel->reltarget->width : 0);
 	plan_replay_append_relids(&line, rel->relids);
 	appendStringInfoString(&line, ",\"relations\":");
 	plan_replay_append_relation_aliases(&line, root, rel->relids);
@@ -1557,7 +2348,7 @@ plan_replay_capture_cardinality(PlannerInfo *root, CardinalityEstimateKind kind,
 	}
 	appendStringInfoString(&line, "}\n");
 
-	written = fwrite(line.data, 1, line.len, plan_replay_cardinality_file);
+	written = fwrite(line.data, 1, line.len, plan_replay_cardinality_capture_stream);
 	if (written != (size_t) line.len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1573,9 +2364,9 @@ plan_replay_replay_cardinality(CardinalityEstimateKind kind)
 	char *end;
 	double rows;
 
-	if (fgets(line, sizeof(line), plan_replay_cardinality_file) == NULL)
+	if (fgets(line, sizeof(line), plan_replay_cardinality_replay_stream) == NULL)
 	{
-		if (ferror(plan_replay_cardinality_file))
+		if (ferror(plan_replay_cardinality_replay_stream))
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read pg_plan_replay cardinality replay file: %m")));
@@ -1586,7 +2377,7 @@ plan_replay_replay_cardinality(CardinalityEstimateKind kind)
 				 errdetail("Expected rows for %s estimate.",
 						   plan_replay_cardinality_kind_name(kind))));
 	}
-	if (strchr(line, '\n') == NULL && !feof(plan_replay_cardinality_file))
+	if (strchr(line, '\n') == NULL && !feof(plan_replay_cardinality_replay_stream))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("pg_plan_replay cardinality replay line " UINT64_FORMAT
@@ -1627,6 +2418,7 @@ plan_replay_cardinality_estimate(PlannerInfo *root, CardinalityEstimateKind kind
 							 bool *sequence_valid, uint64 *sequence)
 {
 	Cardinality rows = native_rows;
+	Cardinality captured_native_rows;
 
 	if (previous_cardinality_estimate_hook != NULL)
 		rows = previous_cardinality_estimate_hook(root, kind, rel,
@@ -1634,18 +2426,18 @@ plan_replay_cardinality_estimate(PlannerInfo *root, CardinalityEstimateKind kind
 													  restrictlist, outer_rows,
 													  inner_rows, native_rows,
 													  sequence_valid, sequence);
-	if (plan_replay_mode == PLAN_REPLAY_MODE_OFF ||
-		plan_replay_cardinality_file == NULL)
+	if (plan_replay_cardinality_capture_stream == NULL &&
+		plan_replay_cardinality_replay_stream == NULL)
 		return rows;
 
 	plan_replay_planner_root = root;
-	if (plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE)
-		plan_replay_capture_cardinality(root, kind, rel, outer_rel, inner_rel, sjinfo,
-									restrictlist, outer_rows, inner_rows, rows);
-	else if (plan_replay_mode == PLAN_REPLAY_MODE_REPLAY)
+	captured_native_rows = rows;
+	if (plan_replay_cardinality_replay_stream != NULL)
 		rows = plan_replay_replay_cardinality(kind);
-	else
-		elog(ERROR, "pg_plan_replay cardinality hook called with invalid mode");
+	if (plan_replay_cardinality_capture_stream != NULL)
+		plan_replay_capture_cardinality(root, kind, rel, outer_rel, inner_rel, sjinfo,
+									restrictlist, outer_rows, inner_rows,
+									captured_native_rows, rows);
 	*sequence_valid = true;
 	*sequence = plan_replay_cardinality_sequence;
 	plan_replay_cardinality_sequence++;
@@ -1655,7 +2447,8 @@ plan_replay_cardinality_estimate(PlannerInfo *root, CardinalityEstimateKind kind
 static bool
 plan_replay_is_active(void)
 {
-	return plan_replay_mode != PLAN_REPLAY_MODE_OFF && plan_replay_path_file != NULL;
+	return plan_replay_path_capture_stream != NULL ||
+		plan_replay_path_replay_stream != NULL;
 }
 
 static void
@@ -1667,9 +2460,19 @@ plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 	foreach(cell, paths)
 	{
 		Path *path = (Path *) lfirst(cell);
+		Cost native_startup_cost = path->startup_cost;
+		Cost native_total_cost = path->total_cost;
+		bool replay_applied = false;
 
 		path->plan_replay_path_sequence_valid = true;
 		path->plan_replay_path_sequence = plan_replay_path_sequence;
+		{
+			PlanReplayPathId id = plan_replay_compute_path_id(path);
+
+			path->plan_replay_path_id_valid = true;
+			path->plan_replay_path_id_hi = id.hi;
+			path->plan_replay_path_id_lo = id.lo;
+		}
 		path->plan_replay_cardinality_sequence_valid = false;
 		path->plan_replay_cardinality_sequence = 0;
 		if (path->param_info != NULL)
@@ -1686,116 +2489,229 @@ plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 			path->plan_replay_cardinality_sequence =
 				path->parent->plan_replay_cardinality_sequence;
 		}
-		if (plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE)
-			plan_replay_capture_path(rel, path, partial);
-		else if (plan_replay_mode == PLAN_REPLAY_MODE_REPLAY)
-			plan_replay_replay_path(path);
-		else
-			elog(ERROR, "pg_plan_replay Path hook called while mode is off");
+		if (plan_replay_cost_table != NULL)
+			replay_applied = plan_replay_replay_path(path);
+		if (plan_replay_path_capture_stream != NULL)
+			plan_replay_capture_path(rel, path, partial,
+								 native_startup_cost, native_total_cost,
+								 replay_applied);
 		plan_replay_path_sequence++;
 	}
 }
 
-static const char *
-plan_replay_selected_path_file(void)
+static void
+plan_replay_require_absolute_file(const char *filename, const char *description)
 {
-	return plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE ?
-		plan_replay_path_capture_file : plan_replay_path_replay_file;
+	if (filename == NULL || filename[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pg_plan_replay %s file path is not configured", description)));
+	if (!is_absolute_path(filename))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pg_plan_replay %s file path must be absolute: \"%s\"",
+						description, filename)));
 }
 
-static const char *
-plan_replay_selected_cardinality_file(void)
+static void
+plan_replay_require_distinct_files(const char *left, const char *left_description,
+								   const char *right, const char *right_description)
 {
-	return plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE ?
-		plan_replay_cardinality_capture_file : plan_replay_cardinality_replay_file;
+	if (left != NULL && left[0] != '\0' && right != NULL && right[0] != '\0' &&
+		strcmp(left, right) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("pg_plan_replay %s and %s files must be different",
+						left_description, right_description)));
+}
+
+static void
+plan_replay_create_path_tables(bool replay_paths)
+{
+	HASHCTL control;
+
+	MemSet(&control, 0, sizeof(control));
+	control.keysize = sizeof(PlanReplayPathId);
+	control.entrysize = sizeof(PlanReplayIdentityEntry);
+	plan_replay_identity_table =
+		hash_create("pg_plan_replay stable Path descriptors", 1024,
+					&control, HASH_ELEM | HASH_BLOBS);
+	if (replay_paths)
+	{
+		MemSet(&control, 0, sizeof(control));
+		control.keysize = sizeof(PlanReplayPathId);
+		control.entrysize = sizeof(PlanReplayCostEntry);
+		plan_replay_cost_table =
+			hash_create("pg_plan_replay sparse Path costs", 128,
+						&control, HASH_ELEM | HASH_BLOBS);
+	}
+}
+
+static void
+plan_replay_destroy_path_tables(void)
+{
+	if (plan_replay_identity_table != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		PlanReplayIdentityEntry *entry;
+
+		hash_seq_init(&status, plan_replay_identity_table);
+		while ((entry = hash_seq_search(&status)) != NULL)
+			pfree(entry->descriptor);
+		hash_destroy(plan_replay_identity_table);
+		plan_replay_identity_table = NULL;
+	}
+	if (plan_replay_cost_table != NULL)
+	{
+		hash_destroy(plan_replay_cost_table);
+		plan_replay_cost_table = NULL;
+	}
 }
 
 static void
 plan_replay_begin_statement(Query *parse, const char *query_string, int cursor_options)
 {
-	const char *filename = NULL;
-	const char *cardinality_filename = NULL;
+	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
+	int cardinality_mode =
+		plan_replay_effective_channel_mode(plan_replay_cardinality_mode);
+	bool capture_paths = plan_replay_mode_captures(path_mode);
+	bool replay_paths = plan_replay_mode_replays(path_mode);
+	bool capture_cardinality = plan_replay_mode_captures(cardinality_mode);
+	bool replay_cardinality = plan_replay_mode_replays(cardinality_mode);
 
-	if (plan_replay_mode == PLAN_REPLAY_MODE_OFF)
+	if (!capture_paths && !replay_paths &&
+		!capture_cardinality && !replay_cardinality)
 		return;
-	filename = plan_replay_selected_path_file();
-	if (filename == NULL || filename[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_plan_replay Path cost file path is not configured")));
-	if (!is_absolute_path(filename))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_plan_replay Path cost file path must be absolute: \"%s\"",
-						filename)));
 
-	cardinality_filename = plan_replay_selected_cardinality_file();
-	if (cardinality_filename == NULL || cardinality_filename[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_plan_replay cardinality file path is not configured")));
-	if (!is_absolute_path(cardinality_filename))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_plan_replay cardinality file path must be absolute: \"%s\"",
-						cardinality_filename)));
-	if (filename != NULL && cardinality_filename != NULL &&
-		strcmp(filename, cardinality_filename) == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_plan_replay Path cost and cardinality files must be different")));
+	if (capture_paths)
+		plan_replay_require_absolute_file(plan_replay_path_capture_file,
+									  "Path capture");
+	if (replay_paths)
+		plan_replay_require_absolute_file(plan_replay_path_replay_file,
+									  "Path replay");
+	if (capture_cardinality)
+		plan_replay_require_absolute_file(plan_replay_cardinality_capture_file,
+									  "cardinality capture");
+	if (replay_cardinality)
+		plan_replay_require_absolute_file(plan_replay_cardinality_replay_file,
+									  "cardinality replay");
+
+	if (capture_paths && replay_paths)
+		plan_replay_require_distinct_files(plan_replay_path_capture_file,
+									   "Path capture",
+									   plan_replay_path_replay_file,
+									   "Path replay");
+	if (capture_cardinality && replay_cardinality)
+		plan_replay_require_distinct_files(plan_replay_cardinality_capture_file,
+									   "cardinality capture",
+									   plan_replay_cardinality_replay_file,
+									   "cardinality replay");
+	if (capture_paths && capture_cardinality)
+		plan_replay_require_distinct_files(plan_replay_path_capture_file,
+									   "Path capture",
+									   plan_replay_cardinality_capture_file,
+									   "cardinality capture");
+	if (replay_paths && replay_cardinality)
+		plan_replay_require_distinct_files(plan_replay_path_replay_file,
+									   "Path replay",
+									   plan_replay_cardinality_replay_file,
+									   "cardinality replay");
+	if (capture_paths && replay_cardinality)
+		plan_replay_require_distinct_files(plan_replay_path_capture_file,
+									   "Path capture",
+									   plan_replay_cardinality_replay_file,
+									   "cardinality replay");
+	if (replay_paths && capture_cardinality)
+		plan_replay_require_distinct_files(plan_replay_path_replay_file,
+									   "Path replay",
+									   plan_replay_cardinality_capture_file,
+									   "cardinality capture");
 
 	plan_replay_path_sequence = 0;
 	plan_replay_batch_count = 0;
 	plan_replay_cardinality_sequence = 0;
+	plan_replay_cost_replay_entry_count = 0;
+	plan_replay_cost_replay_applied_count = 0;
+	plan_replay_cost_replay_matched_entry_count = 0;
 	plan_replay_planner_root = NULL;
 	plan_replay_query = parse;
 	plan_replay_query_string = query_string;
 	plan_replay_cursor_options = cursor_options;
+	if (capture_paths || replay_paths)
+		plan_replay_create_path_tables(replay_paths);
 
-	if (filename != NULL)
+	if (replay_paths)
 	{
-		plan_replay_path_file = AllocateFile(filename,
-								plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE ? "w" : "r");
-		if (plan_replay_path_file == NULL)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open pg_plan_replay Path cost file \"%s\": %m",
-							filename)));
+		plan_replay_path_replay_stream =
+			AllocateFile(plan_replay_path_replay_file, "r");
+		if (plan_replay_path_replay_stream == NULL)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not open pg_plan_replay Path replay file \"%s\": %m",
+								plan_replay_path_replay_file)));
+		plan_replay_load_costs();
 	}
-	if (cardinality_filename != NULL)
+	if (replay_cardinality)
 	{
-		plan_replay_cardinality_file = AllocateFile(cardinality_filename,
-												plan_replay_mode == PLAN_REPLAY_MODE_CAPTURE ?
-												"w" : "r");
-		if (plan_replay_cardinality_file == NULL)
+		plan_replay_cardinality_replay_stream =
+			AllocateFile(plan_replay_cardinality_replay_file, "r");
+		if (plan_replay_cardinality_replay_stream == NULL)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not open pg_plan_replay cardinality file \"%s\": %m",
-							cardinality_filename)));
+					 errmsg("could not open pg_plan_replay cardinality replay file \"%s\": %m",
+							plan_replay_cardinality_replay_file)));
+	}
+	if (capture_paths)
+	{
+		plan_replay_path_capture_stream =
+			AllocateFile(plan_replay_path_capture_file, "w");
+		if (plan_replay_path_capture_stream == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open pg_plan_replay Path capture file \"%s\": %m",
+							plan_replay_path_capture_file)));
+	}
+	if (capture_cardinality)
+	{
+		plan_replay_cardinality_capture_stream =
+			AllocateFile(plan_replay_cardinality_capture_file, "w");
+		if (plan_replay_cardinality_capture_stream == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open pg_plan_replay cardinality capture file \"%s\": %m",
+							plan_replay_cardinality_capture_file)));
 	}
 }
 
 static void
 plan_replay_abort_statement(void)
 {
-	FILE *file = plan_replay_path_file;
-	FILE *cardinality_file = plan_replay_cardinality_file;
+	FILE *path_capture = plan_replay_path_capture_stream;
+	FILE *path_replay = plan_replay_path_replay_stream;
+	FILE *cardinality_capture = plan_replay_cardinality_capture_stream;
+	FILE *cardinality_replay = plan_replay_cardinality_replay_stream;
 
-	plan_replay_path_file = NULL;
-	plan_replay_cardinality_file = NULL;
+	plan_replay_path_capture_stream = NULL;
+	plan_replay_path_replay_stream = NULL;
+	plan_replay_cardinality_capture_stream = NULL;
+	plan_replay_cardinality_replay_stream = NULL;
+	plan_replay_destroy_path_tables();
 	plan_replay_planner_root = NULL;
 	plan_replay_query = NULL;
 	plan_replay_query_string = NULL;
 	plan_replay_cursor_options = 0;
-	if (file != NULL)
-		FreeFile(file);
-	if (cardinality_file != NULL)
-		FreeFile(cardinality_file);
+	if (path_capture != NULL)
+		FreeFile(path_capture);
+	if (path_replay != NULL)
+		FreeFile(path_replay);
+	if (cardinality_capture != NULL)
+		FreeFile(cardinality_capture);
+	if (cardinality_replay != NULL)
+		FreeFile(cardinality_replay);
 }
 
 static void
-plan_replay_finish_file(FILE **file_pointer, int mode, const char *description,
+plan_replay_finish_file(FILE **file_pointer, bool replay, const char *description,
 				 uint64 count, const char *item_name)
 {
 	FILE *file = *file_pointer;
@@ -1805,7 +2721,7 @@ plan_replay_finish_file(FILE **file_pointer, int mode, const char *description,
 	if (file == NULL)
 		return;
 
-	if (mode == PLAN_REPLAY_MODE_REPLAY)
+	if (replay)
 	{
 		int ch;
 
@@ -1848,13 +2764,25 @@ plan_replay_finish_file(FILE **file_pointer, int mode, const char *description,
 static void
 plan_replay_finish_statement(void)
 {
-	plan_replay_finish_file(&plan_replay_path_file, plan_replay_mode, "Path cost",
+	uint64 unmatched_costs = plan_replay_cost_replay_entry_count -
+		plan_replay_cost_replay_matched_entry_count;
+	plan_replay_finish_file(&plan_replay_path_replay_stream, true, "Path cost",
 					plan_replay_path_sequence, "Path");
-	plan_replay_finish_file(&plan_replay_cardinality_file, plan_replay_mode,
+	plan_replay_finish_file(&plan_replay_path_capture_stream, false, "Path cost",
+					plan_replay_path_sequence, "Path");
+	plan_replay_finish_file(&plan_replay_cardinality_replay_stream, true,
+						"cardinality", plan_replay_cardinality_sequence, "estimate");
+	plan_replay_finish_file(&plan_replay_cardinality_capture_stream, false,
 						"cardinality", plan_replay_cardinality_sequence, "estimate");
 	plan_replay_planner_root = NULL;
 	plan_replay_last_path_count = plan_replay_path_sequence;
 	plan_replay_last_batch_count = plan_replay_batch_count;
+	plan_replay_last_cost_replay_entry_count =
+		plan_replay_cost_replay_entry_count;
+	plan_replay_last_cost_replay_applied_count =
+		plan_replay_cost_replay_applied_count;
+	plan_replay_last_cost_replay_unmatched_count = unmatched_costs;
+	plan_replay_destroy_path_tables();
 	plan_replay_query = NULL;
 	plan_replay_query_string = NULL;
 	plan_replay_cursor_options = 0;
@@ -1921,13 +2849,19 @@ plan_replay_planner(Query *parse, const char *query_string, int cursor_options,
 Datum
 plan_replay_last_timing(PG_FUNCTION_ARGS)
 {
-	char json[256];
+	char json[384];
 
 	snprintf(json, sizeof(json),
 			 "{\"planning_ms\":0,\"execution_ms\":0,\"inference_ms\":0,"
 			 "\"batches\":" UINT64_FORMAT ",\"paths\":" UINT64_FORMAT
+			 ",\"cost_replay_entries\":" UINT64_FORMAT
+			 ",\"cost_replay_applied\":" UINT64_FORMAT
+			 ",\"cost_replay_unmatched\":" UINT64_FORMAT
 			 ",\"fallbacks\":0}",
-			 plan_replay_last_batch_count, plan_replay_last_path_count);
+			 plan_replay_last_batch_count, plan_replay_last_path_count,
+			 plan_replay_last_cost_replay_entry_count,
+			 plan_replay_last_cost_replay_applied_count,
+			 plan_replay_last_cost_replay_unmatched_count);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
 }
 
@@ -1939,6 +2873,12 @@ plan_replay_reset_stats(PG_FUNCTION_ARGS)
 	plan_replay_last_path_count = 0;
 	plan_replay_last_batch_count = 0;
 	plan_replay_cardinality_sequence = 0;
+	plan_replay_cost_replay_entry_count = 0;
+	plan_replay_cost_replay_applied_count = 0;
+	plan_replay_cost_replay_matched_entry_count = 0;
+	plan_replay_last_cost_replay_entry_count = 0;
+	plan_replay_last_cost_replay_applied_count = 0;
+	plan_replay_last_cost_replay_unmatched_count = 0;
 	PG_RETURN_VOID();
 }
 
@@ -1946,11 +2886,29 @@ void
 _PG_init(void)
 {
 		DefineCustomEnumVariable("plan_replay.mode",
-							 "Offline Path cost and cardinality operation mode.",
+								 "Offline Path cost and cardinality operation mode.",
 						 NULL,
 						 &plan_replay_mode,
 						 PLAN_REPLAY_MODE_OFF,
 						 plan_replay_mode_options,
+						 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+	DefineCustomEnumVariable("plan_replay.path_mode",
+						 "Path channel mode; inherit uses plan_replay.mode.",
+						 NULL,
+						 &plan_replay_path_mode,
+						 PLAN_REPLAY_CHANNEL_INHERIT,
+						 plan_replay_channel_mode_options,
+						 PGC_SUSET,
+						 0,
+						 NULL, NULL, NULL);
+	DefineCustomEnumVariable("plan_replay.cardinality_mode",
+						 "Cardinality channel mode; inherit uses plan_replay.mode.",
+						 NULL,
+						 &plan_replay_cardinality_mode,
+						 PLAN_REPLAY_CHANNEL_INHERIT,
+						 plan_replay_channel_mode_options,
 						 PGC_SUSET,
 						 0,
 						 NULL, NULL, NULL);
@@ -1963,7 +2921,7 @@ _PG_init(void)
 						   0,
 						   NULL, NULL, NULL);
 	DefineCustomStringVariable("plan_replay.path_replay_file",
-						   "Absolute two-column cost input path for one statement.",
+						   "Absolute sparse stable-ID cost input path for one statement.",
 						   NULL,
 						   &plan_replay_path_replay_file,
 						   "",
