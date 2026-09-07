@@ -1,4 +1,5 @@
 *.o
 *.so
 *.bc
+__pycache__/
 test/

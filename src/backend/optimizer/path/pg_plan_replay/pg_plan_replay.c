@@ -4,12 +4,10 @@
 #include <errno.h>
 #include <math.h>
 
-#include "commands/dbcommands.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
-#include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -19,6 +17,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
+#include "portability/instr_time.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -26,6 +25,8 @@
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
+
+#include "online_prediction.h"
 
 PG_MODULE_MAGIC;
 
@@ -48,7 +49,9 @@ typedef enum PlanReplayChannelMode
 	PLAN_REPLAY_CHANNEL_OFF,
 	PLAN_REPLAY_CHANNEL_CAPTURE,
 	PLAN_REPLAY_CHANNEL_REPLAY,
-	PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY
+	PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY,
+	PLAN_REPLAY_CHANNEL_PREDICT,
+	PLAN_REPLAY_CHANNEL_CAPTURE_PREDICT
 } PlanReplayChannelMode;
 
 #define PLAN_REPLAY_PATH_ID_BYTES 16
@@ -80,7 +83,6 @@ static int plan_replay_path_mode = PLAN_REPLAY_CHANNEL_INHERIT;
 static int plan_replay_cardinality_mode = PLAN_REPLAY_CHANNEL_INHERIT;
 static char *plan_replay_path_capture_file = NULL;
 static char *plan_replay_path_replay_file = NULL;
-static bool plan_replay_path_capture_verbose = false;
 static char *plan_replay_cardinality_capture_file = NULL;
 static char *plan_replay_cardinality_replay_file = NULL;
 
@@ -94,9 +96,6 @@ static FILE *plan_replay_path_replay_stream = NULL;
 static FILE *plan_replay_cardinality_capture_stream = NULL;
 static FILE *plan_replay_cardinality_replay_stream = NULL;
 static PlannerInfo *plan_replay_planner_root = NULL;
-static Query *plan_replay_query = NULL;
-static const char *plan_replay_query_string = NULL;
-static int plan_replay_cursor_options = 0;
 static uint64 plan_replay_path_sequence = 0;
 static uint64 plan_replay_batch_count = 0;
 static uint64 plan_replay_last_path_count = 0;
@@ -108,7 +107,11 @@ static uint64 plan_replay_cost_replay_matched_entry_count = 0;
 static uint64 plan_replay_last_cost_replay_entry_count = 0;
 static uint64 plan_replay_last_cost_replay_applied_count = 0;
 static uint64 plan_replay_last_cost_replay_unmatched_count = 0;
+static double plan_replay_last_planning_ms = 0;
+static PlanReplayOnlineStats plan_replay_current_online_stats;
+static PlanReplayOnlineStats plan_replay_last_online_stats;
 static int plan_replay_planner_depth = 0;
+static bool plan_replay_statement_active = false;
 static HTAB *plan_replay_identity_table = NULL;
 static HTAB *plan_replay_cost_table = NULL;
 
@@ -126,6 +129,17 @@ static const struct config_enum_entry plan_replay_channel_mode_options[] = {
 	{"capture", PLAN_REPLAY_CHANNEL_CAPTURE, false},
 	{"replay", PLAN_REPLAY_CHANNEL_REPLAY, false},
 	{"capture_replay", PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY, false},
+	{"predict", PLAN_REPLAY_CHANNEL_PREDICT, false},
+	{"capture_predict", PLAN_REPLAY_CHANNEL_CAPTURE_PREDICT, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry plan_replay_cardinality_mode_options[] = {
+	{"inherit", PLAN_REPLAY_CHANNEL_INHERIT, false},
+	{"off", PLAN_REPLAY_CHANNEL_OFF, false},
+	{"capture", PLAN_REPLAY_CHANNEL_CAPTURE, false},
+	{"replay", PLAN_REPLAY_CHANNEL_REPLAY, false},
+	{"capture_replay", PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY, false},
 	{NULL, 0, false}
 };
 
@@ -134,13 +148,13 @@ static const char *plan_replay_path_node_name(Path *path);
 static const char *plan_replay_join_type_name(JoinType jointype);
 static void plan_replay_append_path_json(StringInfo output, Path *path);
 static void plan_replay_append_compact_path_json(StringInfo output, Path *path);
-static void plan_replay_append_verbose_path_json(StringInfo output, Path *path);
 static PlanReplayPathId plan_replay_compute_path_id(Path *path);
 static void plan_replay_format_path_id(PlanReplayPathId id, char *output);
 static void plan_replay_load_costs(void);
 static int plan_replay_effective_channel_mode(int channel_mode);
 static bool plan_replay_mode_captures(int mode);
 static bool plan_replay_mode_replays(int mode);
+static bool plan_replay_mode_predicts(int mode);
 static bool plan_replay_is_active(void);
 static void plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial);
 static Cardinality plan_replay_cardinality_estimate(PlannerInfo *root,
@@ -178,7 +192,8 @@ static bool
 plan_replay_mode_captures(int mode)
 {
 	return mode == PLAN_REPLAY_CHANNEL_CAPTURE ||
-		mode == PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY;
+		mode == PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY ||
+		mode == PLAN_REPLAY_CHANNEL_CAPTURE_PREDICT;
 }
 
 static bool
@@ -186,6 +201,13 @@ plan_replay_mode_replays(int mode)
 {
 	return mode == PLAN_REPLAY_CHANNEL_REPLAY ||
 		mode == PLAN_REPLAY_CHANNEL_CAPTURE_REPLAY;
+}
+
+static bool
+plan_replay_mode_predicts(int mode)
+{
+	return mode == PLAN_REPLAY_CHANNEL_PREDICT ||
+		mode == PLAN_REPLAY_CHANNEL_CAPTURE_PREDICT;
 }
 
 static const char *
@@ -300,21 +322,6 @@ plan_replay_path_node_name(Path *path)
 		case T_LimitPath: return "LimitPath";
 		default: return "UnknownPath";
 	}
-}
-
-static const char *
-plan_replay_reloptkind_name(RelOptKind kind)
-{
-	switch (kind)
-	{
-		case RELOPT_BASEREL: return "baserel";
-		case RELOPT_JOINREL: return "joinrel";
-		case RELOPT_OTHER_MEMBER_REL: return "other_member_rel";
-		case RELOPT_OTHER_JOINREL: return "other_joinrel";
-		case RELOPT_UPPER_REL: return "upper_rel";
-		case RELOPT_OTHER_UPPER_REL: return "other_upper_rel";
-	}
-	return "unknown";
 }
 
 static void
@@ -545,33 +552,6 @@ plan_replay_append_restrict_clauses(StringInfo output, PlannerInfo *root, List *
 }
 
 static void
-plan_replay_append_relation_names(StringInfo output, Relids relids)
-{
-	int member = -1;
-	bool first = true;
-
-	appendStringInfoChar(output, '[');
-	while (plan_replay_planner_root != NULL &&
-		   (member = bms_next_member(relids, member)) >= 0)
-	{
-		RangeTblEntry *rte = planner_rt_fetch(member, plan_replay_planner_root);
-		char *name;
-
-		if (rte == NULL || rte->rtekind != RTE_RELATION)
-			continue;
-		name = get_rel_name(rte->relid);
-		if (name == NULL)
-			continue;
-		if (!first)
-			appendStringInfoChar(output, ',');
-		first = false;
-		escape_json(output, name);
-		pfree(name);
-	}
-	appendStringInfoChar(output, ']');
-}
-
-static void
 plan_replay_append_compact_relations(StringInfo output, Relids relids)
 {
 	int member = -1;
@@ -619,498 +599,6 @@ plan_replay_append_compact_relations(StringInfo output, Relids relids)
 }
 
 static void
-plan_replay_append_relation_columns(StringInfo output, RangeTblEntry *rte)
-{
-	ListCell *cell;
-	AttrNumber attnum = 1;
-	bool first = true;
-
-	appendStringInfoChar(output, '[');
-	foreach(cell, rte->eref->colnames)
-	{
-		const char *alias = strVal(lfirst(cell));
-		char *name = get_attname(rte->relid, attnum, true);
-		Oid type_oid = get_atttype(rte->relid, attnum);
-		char *type_name = OidIsValid(type_oid) ? format_type_be(type_oid) : NULL;
-
-		if (!first)
-			appendStringInfoChar(output, ',');
-		first = false;
-		appendStringInfo(output, "{\"attnum\":%d,\"name\":", attnum);
-		if (name != NULL)
-			escape_json(output, name);
-		else
-			appendStringInfoString(output, "null");
-		appendStringInfoString(output, ",\"alias\":");
-		escape_json(output, alias);
-		appendStringInfo(output, ",\"type_oid\":%u,\"type_name\":", type_oid);
-		if (type_name != NULL)
-			escape_json(output, type_name);
-		else
-			appendStringInfoString(output, "null");
-		appendStringInfoChar(output, '}');
-		if (name != NULL)
-			pfree(name);
-		if (type_name != NULL)
-			pfree(type_name);
-		attnum++;
-	}
-	appendStringInfoChar(output, ']');
-}
-
-static void
-plan_replay_append_relations(StringInfo output, Relids relids)
-{
-	int member = -1;
-	bool first = true;
-
-	appendStringInfoChar(output, '[');
-	while (plan_replay_planner_root != NULL &&
-		   (member = bms_next_member(relids, member)) >= 0)
-	{
-		RangeTblEntry *rte = planner_rt_fetch(member, plan_replay_planner_root);
-
-		if (!first)
-			appendStringInfoChar(output, ',');
-		first = false;
-		appendStringInfo(output, "{\"rti\":%d,\"rtekind\":%d", member,
-						 rte != NULL ? (int) rte->rtekind : -1);
-		if (rte != NULL && rte->eref != NULL)
-		{
-			appendStringInfoString(output, ",\"alias\":");
-			escape_json(output, rte->eref->aliasname);
-		}
-		if (rte != NULL && rte->rtekind == RTE_RELATION)
-		{
-			char *name = get_rel_name(rte->relid);
-			char *schema = get_namespace_name(get_rel_namespace(rte->relid));
-
-			appendStringInfo(output, ",\"relation_oid\":%u,\"schema\":",
-							 rte->relid);
-			if (schema != NULL)
-				escape_json(output, schema);
-			else
-				appendStringInfoString(output, "null");
-			appendStringInfoString(output, ",\"name\":");
-			if (name != NULL)
-				escape_json(output, name);
-			else
-				appendStringInfoString(output, "null");
-			appendStringInfoString(output, ",\"columns\":");
-			plan_replay_append_relation_columns(output, rte);
-			if (schema != NULL)
-				pfree(schema);
-			if (name != NULL)
-				pfree(name);
-		}
-		appendStringInfoChar(output, '}');
-	}
-	appendStringInfoChar(output, ']');
-}
-
-static void
-plan_replay_append_planner_settings(StringInfo output)
-{
-	static const char *const names[] = {
-		"search_path",
-		"plan_cache_mode",
-		"default_statistics_target",
-		"effective_cache_size",
-		"effective_io_concurrency",
-		"work_mem",
-		"seq_page_cost",
-		"random_page_cost",
-		"cpu_tuple_cost",
-		"cpu_index_tuple_cost",
-		"cpu_operator_cost",
-		"parallel_setup_cost",
-		"parallel_tuple_cost",
-		"min_parallel_table_scan_size",
-		"min_parallel_index_scan_size",
-		"max_parallel_workers_per_gather",
-		"cursor_tuple_fraction",
-		"from_collapse_limit",
-		"join_collapse_limit",
-		"geqo",
-		"geqo_threshold",
-		"geqo_seed",
-		"enable_async_append",
-		"enable_bitmapscan",
-		"enable_gathermerge",
-		"enable_hashagg",
-		"enable_hashjoin",
-		"enable_incremental_sort",
-		"enable_indexscan",
-		"enable_indexonlyscan",
-		"enable_material",
-		"enable_memoize",
-		"enable_mergejoin",
-		"enable_nestloop",
-		"enable_parallel_append",
-		"enable_parallel_hash",
-		"enable_partition_pruning",
-		"enable_partitionwise_aggregate",
-		"enable_partitionwise_join",
-		"enable_presorted_aggregate",
-		"enable_seqscan",
-		"enable_sort",
-		"enable_tidscan"
-	};
-	bool first = true;
-	int i;
-
-	appendStringInfoChar(output, '{');
-	for (i = 0; i < lengthof(names); i++)
-	{
-		char *value = GetConfigOptionByName(names[i], NULL, true);
-
-		if (value == NULL)
-			continue;
-		if (!first)
-			appendStringInfoChar(output, ',');
-		first = false;
-		escape_json(output, names[i]);
-		appendStringInfoChar(output, ':');
-		escape_json(output, value);
-		pfree(value);
-	}
-	appendStringInfoChar(output, '}');
-}
-
-static void
-plan_replay_append_pathtarget(StringInfo output, PathTarget *target)
-{
-	ListCell *cell;
-	int index = 0;
-	bool first = true;
-
-	if (target == NULL)
-	{
-		appendStringInfoString(output, "null");
-		return;
-	}
-	appendStringInfo(output,
-					 "{\"width\":%d,\"startup_cost\":%.17g,"
-					 "\"per_tuple_cost\":%.17g,\"has_volatile_expr\":%d,"
-					 "\"expressions\":[",
-					 target->width, target->cost.startup, target->cost.per_tuple,
-					 (int) target->has_volatile_expr);
-	foreach(cell, target->exprs)
-	{
-		Node *expr = (Node *) lfirst(cell);
-		Index sortgroupref = get_pathtarget_sortgroupref(target, index++);
-
-		if (!first)
-			appendStringInfoChar(output, ',');
-		first = false;
-		appendStringInfo(output, "{\"sortgroupref\":%u,\"expression\":",
-						 sortgroupref);
-		plan_replay_append_node_dump(output, expr);
-		appendStringInfoChar(output, '}');
-	}
-	appendStringInfoString(output, "]}");
-}
-
-static void
-plan_replay_append_relation_info(StringInfo output, RelOptInfo *rel)
-{
-	appendStringInfoString(output, "{\"kind\":");
-	escape_json(output, plan_replay_reloptkind_name(rel->reloptkind));
-	appendStringInfo(output,
-					 ",\"relid\":%u,\"rtekind\":%d,\"rows\":%.17g,"
-					 "\"pages\":%u,\"tuples\":%.17g,\"allvisfrac\":%.17g,"
-					 "\"consider_startup\":%s,\"consider_param_startup\":%s,"
-					 "\"consider_parallel\":%s,\"rel_parallel_workers\":%d,"
-					 "\"baserestrict_startup_cost\":%.17g,"
-					 "\"baserestrict_per_tuple_cost\":%.17g,\"relids\":",
-					 rel->relid, (int) rel->rtekind, rel->rows, rel->pages,
-					 rel->tuples, rel->allvisfrac,
-					 rel->consider_startup ? "true" : "false",
-					 rel->consider_param_startup ? "true" : "false",
-					 rel->consider_parallel ? "true" : "false",
-					 rel->rel_parallel_workers,
-					 rel->baserestrictcost.startup,
-					 rel->baserestrictcost.per_tuple);
-	plan_replay_append_relids(output, rel->relids);
-	appendStringInfoString(output, ",\"direct_lateral_relids\":");
-	plan_replay_append_relids(output, rel->direct_lateral_relids);
-	appendStringInfoString(output, ",\"lateral_relids\":");
-	plan_replay_append_relids(output, rel->lateral_relids);
-	appendStringInfoString(output, ",\"base_restrictions\":");
-	plan_replay_append_node_dump(output, rel->baserestrictinfo);
-	appendStringInfoString(output, ",\"join_clauses\":");
-	plan_replay_append_node_dump(output, rel->joininfo);
-	appendStringInfoString(output, ",\"partition_qual\":");
-	plan_replay_append_node_dump(output, rel->partition_qual);
-	appendStringInfoChar(output, '}');
-}
-
-static void
-plan_replay_append_path_details(StringInfo output, Path *path)
-{
-	appendStringInfoChar(output, '{');
-	switch (nodeTag(path))
-	{
-		case T_IndexPath:
-		{
-			IndexPath *index_path = (IndexPath *) path;
-			IndexOptInfo *index = index_path->indexinfo;
-
-			appendStringInfo(output,
-							 "\"scan_direction\":%d,\"index_total_cost\":%.17g,"
-							 "\"index_selectivity\":%.17g,\"index_clauses\":",
-							 (int) index_path->indexscandir,
-							 index_path->indextotalcost,
-							 index_path->indexselectivity);
-			plan_replay_append_node_dump(output, index_path->indexclauses);
-			appendStringInfoString(output, ",\"index_orderbys\":");
-			plan_replay_append_node_dump(output, index_path->indexorderbys);
-			appendStringInfoString(output, ",\"index_orderby_columns\":");
-			plan_replay_append_node_dump(output, index_path->indexorderbycols);
-			if (index != NULL)
-			{
-				appendStringInfo(output,
-								 ",\"index_oid\":%u,\"index_pages\":%u,"
-								 "\"index_tuples\":%.17g,\"tree_height\":%d,"
-								 "\"ncolumns\":%d,\"nkeycolumns\":%d,"
-								 "\"unique\":%s,\"predicate_matches\":%s,"
-								 "\"index_predicate\":",
-								 index->indexoid, index->pages, index->tuples,
-								 index->tree_height, index->ncolumns,
-								 index->nkeycolumns,
-								 index->unique ? "true" : "false",
-								 index->predOK ? "true" : "false");
-				plan_replay_append_node_dump(output, index->indpred);
-				appendStringInfoString(output, ",\"index_expressions\":");
-				plan_replay_append_node_dump(output, index->indexprs);
-				appendStringInfoString(output, ",\"index_restrictions\":");
-				plan_replay_append_node_dump(output, index->indrestrictinfo);
-			}
-			break;
-		}
-		case T_BitmapAndPath:
-			appendStringInfo(output, "\"bitmap_selectivity\":%.17g",
-							 ((BitmapAndPath *) path)->bitmapselectivity);
-			break;
-		case T_BitmapOrPath:
-			appendStringInfo(output, "\"bitmap_selectivity\":%.17g",
-							 ((BitmapOrPath *) path)->bitmapselectivity);
-			break;
-		case T_TidPath:
-			appendStringInfoString(output, "\"tid_quals\":");
-			plan_replay_append_node_dump(output, ((TidPath *) path)->tidquals);
-			break;
-		case T_TidRangePath:
-			appendStringInfoString(output, "\"tid_range_quals\":");
-			plan_replay_append_node_dump(output, ((TidRangePath *) path)->tidrangequals);
-			break;
-		case T_ForeignPath:
-			appendStringInfoString(output, "\"fdw_restrictions\":");
-			plan_replay_append_node_dump(output, ((ForeignPath *) path)->fdw_restrictinfo);
-			appendStringInfoString(output, ",\"fdw_private\":");
-			plan_replay_append_node_dump(output, ((ForeignPath *) path)->fdw_private);
-			break;
-		case T_CustomPath:
-			appendStringInfo(output, "\"flags\":%u,\"custom_restrictions\":",
-							 ((CustomPath *) path)->flags);
-			plan_replay_append_node_dump(output, ((CustomPath *) path)->custom_restrictinfo);
-			appendStringInfoString(output, ",\"custom_private\":");
-			plan_replay_append_node_dump(output, ((CustomPath *) path)->custom_private);
-			break;
-		case T_AppendPath:
-			appendStringInfo(output,
-							 "\"first_partial_path\":%d,\"limit_tuples\":%.17g",
-							 ((AppendPath *) path)->first_partial_path,
-							 ((AppendPath *) path)->limit_tuples);
-			break;
-		case T_MergeAppendPath:
-			appendStringInfo(output, "\"limit_tuples\":%.17g",
-							 ((MergeAppendPath *) path)->limit_tuples);
-			break;
-		case T_GroupResultPath:
-			appendStringInfoString(output, "\"quals\":");
-			plan_replay_append_node_dump(output, ((GroupResultPath *) path)->quals);
-			break;
-		case T_MemoizePath:
-		{
-			MemoizePath *memoize = (MemoizePath *) path;
-
-			appendStringInfo(output,
-							 "\"single_row\":%s,\"binary_mode\":%s,"
-							 "\"calls\":%.17g,\"estimated_entries\":%u,"
-							 "\"hash_operators\":",
-							 memoize->singlerow ? "true" : "false",
-							 memoize->binary_mode ? "true" : "false",
-							 memoize->calls, memoize->est_entries);
-			plan_replay_append_node_dump(output, memoize->hash_operators);
-			appendStringInfoString(output, ",\"parameter_expressions\":");
-			plan_replay_append_node_dump(output, memoize->param_exprs);
-			break;
-		}
-		case T_UniquePath:
-			appendStringInfo(output, "\"method\":%d,\"operators\":",
-							 (int) ((UniquePath *) path)->umethod);
-			plan_replay_append_node_dump(output, ((UniquePath *) path)->in_operators);
-			appendStringInfoString(output, ",\"expressions\":");
-			plan_replay_append_node_dump(output, ((UniquePath *) path)->uniq_exprs);
-			break;
-		case T_GatherPath:
-			appendStringInfo(output, "\"single_copy\":%s,\"workers\":%d",
-							 ((GatherPath *) path)->single_copy ? "true" : "false",
-							 ((GatherPath *) path)->num_workers);
-			break;
-		case T_GatherMergePath:
-			appendStringInfo(output, "\"workers\":%d",
-							 ((GatherMergePath *) path)->num_workers);
-			break;
-		case T_NestPath:
-		case T_MergePath:
-		case T_HashPath:
-		{
-			JoinPath *join = (JoinPath *) path;
-
-			appendStringInfo(output,
-							 "\"join_type\":%d,\"inner_unique\":%s,"
-							 "\"join_restrictions\":",
-							 (int) join->jointype,
-							 join->inner_unique ? "true" : "false");
-			plan_replay_append_node_dump(output, join->joinrestrictinfo);
-			if (IsA(path, MergePath))
-			{
-				MergePath *merge = (MergePath *) path;
-
-				appendStringInfoString(output, ",\"merge_clauses\":");
-				plan_replay_append_node_dump(output, merge->path_mergeclauses);
-				appendStringInfoString(output, ",\"outer_sortkeys\":");
-				plan_replay_append_node_dump(output, merge->outersortkeys);
-				appendStringInfoString(output, ",\"inner_sortkeys\":");
-				plan_replay_append_node_dump(output, merge->innersortkeys);
-				appendStringInfo(output,
-								 ",\"outer_presorted_keys\":%d,"
-								 "\"skip_mark_restore\":%s,"
-								 "\"materialize_inner\":%s",
-								 merge->outer_presorted_keys,
-								 merge->skip_mark_restore ? "true" : "false",
-								 merge->materialize_inner ? "true" : "false");
-			}
-			else if (IsA(path, HashPath))
-			{
-				HashPath *hash = (HashPath *) path;
-
-				appendStringInfoString(output, ",\"hash_clauses\":");
-				plan_replay_append_node_dump(output, hash->path_hashclauses);
-				appendStringInfo(output,
-								 ",\"batches\":%d,\"inner_rows_total\":%.17g",
-								 hash->num_batches, hash->inner_rows_total);
-			}
-			break;
-		}
-		case T_ProjectionPath:
-			appendStringInfo(output, "\"dummy\":%s",
-							 ((ProjectionPath *) path)->dummypp ? "true" : "false");
-			break;
-		case T_IncrementalSortPath:
-			appendStringInfo(output, "\"presorted_columns\":%d",
-							 ((IncrementalSortPath *) path)->nPresortedCols);
-			break;
-		case T_GroupPath:
-			appendStringInfoString(output, "\"group_clause\":");
-			plan_replay_append_node_dump(output, ((GroupPath *) path)->groupClause);
-			appendStringInfoString(output, ",\"having_quals\":");
-			plan_replay_append_node_dump(output, ((GroupPath *) path)->qual);
-			break;
-		case T_UpperUniquePath:
-			appendStringInfo(output, "\"keys\":%d",
-							 ((UpperUniquePath *) path)->numkeys);
-			break;
-		case T_AggPath:
-		{
-			AggPath *agg = (AggPath *) path;
-
-			appendStringInfo(output,
-							 "\"strategy\":%d,\"split\":%d,\"groups\":%.17g,"
-							 "\"transition_space\":" UINT64_FORMAT ","
-							 "\"group_clause\":",
-							 (int) agg->aggstrategy, (int) agg->aggsplit,
-							 agg->numGroups, agg->transitionSpace);
-			plan_replay_append_node_dump(output, agg->groupClause);
-			appendStringInfoString(output, ",\"having_quals\":");
-			plan_replay_append_node_dump(output, agg->qual);
-			break;
-		}
-		case T_GroupingSetsPath:
-			appendStringInfo(output, "\"strategy\":%d,\"rollups\":",
-							 (int) ((GroupingSetsPath *) path)->aggstrategy);
-			plan_replay_append_node_dump(output, ((GroupingSetsPath *) path)->rollups);
-			appendStringInfoString(output, ",\"having_quals\":");
-			plan_replay_append_node_dump(output, ((GroupingSetsPath *) path)->qual);
-			break;
-		case T_MinMaxAggPath:
-			appendStringInfoString(output, "\"aggregates\":");
-			plan_replay_append_node_dump(output, ((MinMaxAggPath *) path)->mmaggregates);
-			appendStringInfoString(output, ",\"having_quals\":");
-			plan_replay_append_node_dump(output, ((MinMaxAggPath *) path)->quals);
-			break;
-		case T_WindowAggPath:
-			appendStringInfo(output, "\"top_window\":%s,\"window_clause\":",
-							 ((WindowAggPath *) path)->topwindow ? "true" : "false");
-			plan_replay_append_node_dump(output, ((WindowAggPath *) path)->winclause);
-			appendStringInfoString(output, ",\"quals\":");
-			plan_replay_append_node_dump(output, ((WindowAggPath *) path)->qual);
-			appendStringInfoString(output, ",\"run_condition\":");
-			plan_replay_append_node_dump(output, ((WindowAggPath *) path)->runCondition);
-			break;
-		case T_SetOpPath:
-			appendStringInfo(output,
-							 "\"command\":%d,\"strategy\":%d,\"groups\":%.17g,"
-							 "\"group_list\":",
-							 (int) ((SetOpPath *) path)->cmd,
-							 (int) ((SetOpPath *) path)->strategy,
-							 ((SetOpPath *) path)->numGroups);
-			plan_replay_append_node_dump(output, ((SetOpPath *) path)->groupList);
-			break;
-		case T_RecursiveUnionPath:
-			appendStringInfo(output, "\"worktable_param\":%d,\"groups\":%.17g,"
-							 "\"distinct_list\":",
-							 ((RecursiveUnionPath *) path)->wtParam,
-							 ((RecursiveUnionPath *) path)->numGroups);
-			plan_replay_append_node_dump(output, ((RecursiveUnionPath *) path)->distinctList);
-			break;
-		case T_LockRowsPath:
-			appendStringInfo(output, "\"epq_param\":%d,\"row_marks\":",
-							 ((LockRowsPath *) path)->epqParam);
-			plan_replay_append_node_dump(output, ((LockRowsPath *) path)->rowMarks);
-			break;
-		case T_ModifyTablePath:
-			appendStringInfo(output,
-							 "\"operation\":%d,\"nominal_relation\":%u,"
-							 "\"root_relation\":%u,\"epq_param\":%d,"
-							 "\"returning_lists\":",
-							 (int) ((ModifyTablePath *) path)->operation,
-							 ((ModifyTablePath *) path)->nominalRelation,
-							 ((ModifyTablePath *) path)->rootRelation,
-							 ((ModifyTablePath *) path)->epqParam);
-			plan_replay_append_node_dump(output, ((ModifyTablePath *) path)->returningLists);
-			appendStringInfoString(output, ",\"on_conflict\":");
-			plan_replay_append_node_dump(output, ((ModifyTablePath *) path)->onconflict);
-			appendStringInfoString(output, ",\"merge_join_conditions\":");
-			plan_replay_append_node_dump(output,
-							 ((ModifyTablePath *) path)->mergeJoinConditions);
-			break;
-		case T_LimitPath:
-			appendStringInfo(output, "\"option\":%d,\"offset\":",
-							 (int) ((LimitPath *) path)->limitOption);
-			plan_replay_append_node_dump(output, ((LimitPath *) path)->limitOffset);
-			appendStringInfoString(output, ",\"count\":");
-			plan_replay_append_node_dump(output, ((LimitPath *) path)->limitCount);
-			break;
-		default:
-			break;
-	}
-	appendStringInfoChar(output, '}');
-}
-
-static void
 plan_replay_append_child(StringInfo output, Path *child, bool *first)
 {
 	if (child == NULL)
@@ -1131,168 +619,6 @@ plan_replay_append_path_list(StringInfo output, List *paths, bool *first)
 }
 
 static void
-plan_replay_append_verbose_path_json(StringInfo output, Path *path)
-{
-	bool first_child = true;
-	Relids required_outer = PATH_REQ_OUTER(path);
-
-	appendStringInfoChar(output, '{');
-	appendStringInfoString(output, "\"node_tag\":");
-	escape_json(output, plan_replay_path_node_name(path));
-	appendStringInfo(output, ",\"node_tag_id\":%d,\"pathtype_id\":%d,\"op_name\":",
-					 (int) nodeTag(path), (int) path->pathtype);
-	escape_json(output, plan_replay_operator_name(path));
-	appendStringInfo(output,
-					 ",\"native_startup_cost\":%.17g"
-					 ",\"native_total_cost\":%.17g"
-					 ",\"rows\":%.17g,\"width\":%d"
-					 ",\"disabled_nodes\":%d"
-					 ",\"parallel_aware\":%s,\"parallel_safe\":%s"
-					 ",\"parallel_workers\":%d,\"parameterized\":%s,"
-					 "\"parameterized_rows\":%.17g,\"required_outer\":",
-					 path->startup_cost, path->total_cost, path->rows,
-					 path->pathtarget ? path->pathtarget->width : 0,
-					 path->disabled_nodes,
-					 path->parallel_aware ? "true" : "false",
-					 path->parallel_safe ? "true" : "false",
-					 path->parallel_workers,
-					 path->param_info != NULL ? "true" : "false",
-					 path->param_info != NULL ? path->param_info->ppi_rows : path->rows);
-	plan_replay_append_relids(output, required_outer);
-	appendStringInfoString(output, ",\"parameter_clauses\":");
-	plan_replay_append_node_dump(output,
-					 path->param_info != NULL ? path->param_info->ppi_clauses : NULL);
-	appendStringInfoString(output, ",\"pathkeys\":");
-	plan_replay_append_node_dump(output, path->pathkeys);
-	appendStringInfo(output, ",\"pathkey_count\":%d,\"pathtarget\":",
-					 list_length(path->pathkeys));
-	plan_replay_append_pathtarget(output, path->pathtarget);
-	appendStringInfoString(output, ",\"relids\":");
-	plan_replay_append_relids(output, path->parent ? path->parent->relids : NULL);
-	appendStringInfoString(output, ",\"relation_names\":");
-	plan_replay_append_relation_names(output, path->parent ? path->parent->relids : NULL);
-	appendStringInfoString(output, ",\"relations\":");
-	plan_replay_append_relations(output, path->parent ? path->parent->relids : NULL);
-	appendStringInfoString(output, ",\"relation_info\":");
-	if (path->parent != NULL)
-		plan_replay_append_relation_info(output, path->parent);
-	else
-		appendStringInfoString(output, "null");
-
-	if (IsA(path, IndexPath) && ((IndexPath *) path)->indexinfo != NULL)
-	{
-		char *index_name = get_rel_name(((IndexPath *) path)->indexinfo->indexoid);
-
-		if (index_name != NULL)
-		{
-			appendStringInfoString(output, ",\"index_name\":");
-			escape_json(output, index_name);
-			pfree(index_name);
-		}
-	}
-
-	appendStringInfoString(output, ",\"raw_path\":");
-	plan_replay_append_node_dump(output, path);
-	appendStringInfoString(output, ",\"details\":");
-	plan_replay_append_path_details(output, path);
-
-	appendStringInfoString(output, ",\"children\":[");
-	switch (nodeTag(path))
-	{
-		case T_BitmapHeapPath:
-			plan_replay_append_child(output, ((BitmapHeapPath *) path)->bitmapqual, &first_child);
-			break;
-		case T_BitmapAndPath:
-			plan_replay_append_path_list(output, ((BitmapAndPath *) path)->bitmapquals, &first_child);
-			break;
-		case T_BitmapOrPath:
-			plan_replay_append_path_list(output, ((BitmapOrPath *) path)->bitmapquals, &first_child);
-			break;
-		case T_SubqueryScanPath:
-			plan_replay_append_child(output, ((SubqueryScanPath *) path)->subpath, &first_child);
-			break;
-		case T_ForeignPath:
-			plan_replay_append_child(output, ((ForeignPath *) path)->fdw_outerpath, &first_child);
-			break;
-		case T_CustomPath:
-			plan_replay_append_path_list(output, ((CustomPath *) path)->custom_paths, &first_child);
-			break;
-		case T_AppendPath:
-			plan_replay_append_path_list(output, ((AppendPath *) path)->subpaths, &first_child);
-			break;
-		case T_MergeAppendPath:
-			plan_replay_append_path_list(output, ((MergeAppendPath *) path)->subpaths, &first_child);
-			break;
-		case T_MaterialPath:
-			plan_replay_append_child(output, ((MaterialPath *) path)->subpath, &first_child);
-			break;
-		case T_MemoizePath:
-			plan_replay_append_child(output, ((MemoizePath *) path)->subpath, &first_child);
-			break;
-		case T_UniquePath:
-			plan_replay_append_child(output, ((UniquePath *) path)->subpath, &first_child);
-			break;
-		case T_GatherPath:
-			plan_replay_append_child(output, ((GatherPath *) path)->subpath, &first_child);
-			break;
-		case T_GatherMergePath:
-			plan_replay_append_child(output, ((GatherMergePath *) path)->subpath, &first_child);
-			break;
-		case T_NestPath:
-		case T_MergePath:
-		case T_HashPath:
-			plan_replay_append_child(output, ((JoinPath *) path)->outerjoinpath, &first_child);
-			plan_replay_append_child(output, ((JoinPath *) path)->innerjoinpath, &first_child);
-			break;
-		case T_ProjectionPath:
-			plan_replay_append_child(output, ((ProjectionPath *) path)->subpath, &first_child);
-			break;
-		case T_ProjectSetPath:
-			plan_replay_append_child(output, ((ProjectSetPath *) path)->subpath, &first_child);
-			break;
-		case T_SortPath:
-		case T_IncrementalSortPath:
-			plan_replay_append_child(output, ((SortPath *) path)->subpath, &first_child);
-			break;
-		case T_GroupPath:
-			plan_replay_append_child(output, ((GroupPath *) path)->subpath, &first_child);
-			break;
-		case T_UpperUniquePath:
-			plan_replay_append_child(output, ((UpperUniquePath *) path)->subpath, &first_child);
-			break;
-		case T_AggPath:
-			plan_replay_append_child(output, ((AggPath *) path)->subpath, &first_child);
-			break;
-		case T_GroupingSetsPath:
-			plan_replay_append_child(output, ((GroupingSetsPath *) path)->subpath, &first_child);
-			break;
-		case T_WindowAggPath:
-			plan_replay_append_child(output, ((WindowAggPath *) path)->subpath, &first_child);
-			break;
-		case T_SetOpPath:
-			plan_replay_append_child(output, ((SetOpPath *) path)->leftpath, &first_child);
-			plan_replay_append_child(output, ((SetOpPath *) path)->rightpath, &first_child);
-			break;
-		case T_RecursiveUnionPath:
-			plan_replay_append_child(output, ((RecursiveUnionPath *) path)->leftpath, &first_child);
-			plan_replay_append_child(output, ((RecursiveUnionPath *) path)->rightpath, &first_child);
-			break;
-		case T_LockRowsPath:
-			plan_replay_append_child(output, ((LockRowsPath *) path)->subpath, &first_child);
-			break;
-		case T_ModifyTablePath:
-			plan_replay_append_child(output, ((ModifyTablePath *) path)->subpath, &first_child);
-			break;
-		case T_LimitPath:
-			plan_replay_append_child(output, ((LimitPath *) path)->subpath, &first_child);
-			break;
-		default:
-			break;
-	}
-	appendStringInfoString(output, "]}");
-}
-
-static void
 plan_replay_append_compact_path_json(StringInfo output, Path *path)
 {
 	bool first_child = true;
@@ -1303,13 +629,14 @@ plan_replay_append_compact_path_json(StringInfo output, Path *path)
 	appendStringInfo(output,
 					 ",\"startup_cost\":%.17g,\"total_cost\":%.17g"
 					 ",\"rows\":%.17g,\"width\":%d,\"pathkeys\":%d"
-					 ",\"parallel_aware\":%s,\"parallel_workers\":%d"
-					 ",\"relids\":",
-					 path->startup_cost, path->total_cost, path->rows,
+					 ",\"parallel_aware\":%s,\"parallel_workers\":%d",
+					 path->startup_cost, path->total_cost,
+					 path->rows,
 					 path->pathtarget != NULL ? path->pathtarget->width : 0,
 					 list_length(path->pathkeys),
 					 path->parallel_aware ? "true" : "false",
 					 path->parallel_workers);
+	appendStringInfoString(output, ",\"relids\":");
 	plan_replay_append_relids(output, path->parent != NULL ? path->parent->relids : NULL);
 	appendStringInfoString(output, ",\"relations\":");
 	plan_replay_append_compact_relations(output,
@@ -1431,10 +758,7 @@ plan_replay_append_compact_path_json(StringInfo output, Path *path)
 static void
 plan_replay_append_path_json(StringInfo output, Path *path)
 {
-	if (plan_replay_path_capture_verbose)
-		plan_replay_append_verbose_path_json(output, path);
-	else
-		plan_replay_append_compact_path_json(output, path);
+	plan_replay_append_compact_path_json(output, path);
 }
 
 static int
@@ -2005,62 +1329,33 @@ plan_replay_compute_path_id(Path *path)
 static void
 plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial,
 					 Cost native_startup_cost, Cost native_total_cost,
-					 bool replay_applied)
+					 bool replay_applied, bool model_applied)
 {
 	StringInfoData line;
 	PlanReplayPathId id;
 	char path_id[PLAN_REPLAY_PATH_ID_HEX_LENGTH + 1];
 	size_t written;
-	char *database_name = NULL;
-	char *user_name = NULL;
 
 	initStringInfo(&line);
 	Assert(path->plan_replay_path_id_valid);
 	id.hi = path->plan_replay_path_id_hi;
 	id.lo = path->plan_replay_path_id_lo;
 	plan_replay_format_path_id(id, path_id);
-	if (!plan_replay_path_capture_verbose)
-		appendStringInfo(&line,
-						 "{\"format_version\":5,\"sequence\":" UINT64_FORMAT,
-						 plan_replay_path_sequence);
-	else
-	{
-		database_name = get_database_name(MyDatabaseId);
-		user_name = GetUserNameFromId(GetUserId(), false);
-		appendStringInfo(&line, "{\"sequence\":" UINT64_FORMAT
-						 ",\"format_version\":3,\"server_version_num\":%d,"
-						 "\"query_id\":" INT64_FORMAT ",\"command_type\":%d,"
-						 "\"cursor_options\":%d,\"database\":",
-						 plan_replay_path_sequence, PG_VERSION_NUM,
-						 plan_replay_query != NULL ? plan_replay_query->queryId : INT64CONST(0),
-						 plan_replay_query != NULL ? (int) plan_replay_query->commandType : 0,
-						 plan_replay_cursor_options);
-		if (database_name != NULL)
-			escape_json(&line, database_name);
-		else
-			appendStringInfoString(&line, "null");
-		appendStringInfoString(&line, ",\"user\":");
-		if (user_name != NULL)
-			escape_json(&line, user_name);
-		else
-			appendStringInfoString(&line, "null");
-		appendStringInfoString(&line, ",\"query\":");
-		if (plan_replay_query_string != NULL)
-			escape_json(&line, plan_replay_query_string);
-		else
-			appendStringInfoString(&line, "null");
-		appendStringInfoString(&line, ",\"raw_query\":");
-		plan_replay_append_node_dump(&line, plan_replay_query);
-		appendStringInfoString(&line, ",\"planner_settings\":");
-		plan_replay_append_planner_settings(&line);
-	}
+	appendStringInfo(&line,
+					 "{\"format_version\":6,\"sequence\":" UINT64_FORMAT,
+					 plan_replay_path_sequence);
 	appendStringInfoString(&line, ",\"path_id\":");
 	escape_json(&line, path_id);
 	appendStringInfo(&line,
 					 ",\"cost_replay_applied\":%s,"
-					 "\"native_startup_cost\":%.17g,\"native_total_cost\":%.17g",
+					 "\"model_prediction_applied\":%s,\"cost_source\":\"%s\","
+					 "\"native_startup_cost\":%.17g,\"native_total_cost\":%.17g,"
+					 "\"effective_startup_cost\":%.17g,\"effective_total_cost\":%.17g",
 					 replay_applied ? "true" : "false",
-					 native_startup_cost, native_total_cost);
+					 model_applied ? "true" : "false",
+					 model_applied ? "model" : replay_applied ? "file" : "native",
+					 native_startup_cost, native_total_cost,
+					 path->startup_cost, path->total_cost);
 	appendStringInfoString(&line, ",\"cardinality_sequence\":");
 	if (path->plan_replay_cardinality_sequence_valid)
 		appendStringInfo(&line, UINT64_FORMAT,
@@ -2079,10 +1374,6 @@ plan_replay_capture_path(RelOptInfo *rel, Path *path, bool partial,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 					 errmsg("could not write pg_plan_replay capture file: %m")));
-	if (database_name != NULL)
-		pfree(database_name);
-	if (user_name != NULL)
-		pfree(user_name);
 	pfree(line.data);
 }
 
@@ -2447,22 +1738,38 @@ plan_replay_cardinality_estimate(PlannerInfo *root, CardinalityEstimateKind kind
 static bool
 plan_replay_is_active(void)
 {
+	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
+
 	return plan_replay_path_capture_stream != NULL ||
-		plan_replay_path_replay_stream != NULL;
+		plan_replay_path_replay_stream != NULL ||
+		plan_replay_mode_predicts(path_mode);
 }
 
 static void
 plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 {
 	ListCell *cell;
+	Cost *native_startup_costs;
+	Cost *native_total_costs;
+	bool *replay_applied;
+	bool model_applied = false;
+	int path_count = list_length(paths);
+	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
+	int index = 0;
+
+	if (path_count == 0)
+		return;
+	native_startup_costs = palloc(sizeof(Cost) * path_count);
+	native_total_costs = palloc(sizeof(Cost) * path_count);
+	replay_applied = palloc0(sizeof(bool) * path_count);
 
 	plan_replay_batch_count++;
 	foreach(cell, paths)
 	{
 		Path *path = (Path *) lfirst(cell);
-		Cost native_startup_cost = path->startup_cost;
-		Cost native_total_cost = path->total_cost;
-		bool replay_applied = false;
+
+		native_startup_costs[index] = path->startup_cost;
+		native_total_costs[index] = path->total_cost;
 
 		path->plan_replay_path_sequence_valid = true;
 		path->plan_replay_path_sequence = plan_replay_path_sequence;
@@ -2490,13 +1797,31 @@ plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 				path->parent->plan_replay_cardinality_sequence;
 		}
 		if (plan_replay_cost_table != NULL)
-			replay_applied = plan_replay_replay_path(path);
+			replay_applied[index] = plan_replay_replay_path(path);
+		index++;
+	}
+
+	if (plan_replay_mode_predicts(path_mode))
+		model_applied = plan_replay_online_predict_paths(plan_replay_planner_root,
+												  rel, paths, partial,
+												  &plan_replay_current_online_stats);
+
+	index = 0;
+	foreach(cell, paths)
+	{
+		Path *path = (Path *) lfirst(cell);
+
 		if (plan_replay_path_capture_stream != NULL)
 			plan_replay_capture_path(rel, path, partial,
-								 native_startup_cost, native_total_cost,
-								 replay_applied);
+								 native_startup_costs[index],
+								 native_total_costs[index],
+								 replay_applied[index], model_applied);
 		plan_replay_path_sequence++;
+		index++;
 	}
+	pfree(replay_applied);
+	pfree(native_total_costs);
+	pfree(native_startup_costs);
 }
 
 static void
@@ -2569,19 +1894,22 @@ plan_replay_destroy_path_tables(void)
 }
 
 static void
-plan_replay_begin_statement(Query *parse, const char *query_string, int cursor_options)
+plan_replay_begin_statement(void)
 {
 	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
 	int cardinality_mode =
 		plan_replay_effective_channel_mode(plan_replay_cardinality_mode);
 	bool capture_paths = plan_replay_mode_captures(path_mode);
 	bool replay_paths = plan_replay_mode_replays(path_mode);
+	bool predict_paths = plan_replay_mode_predicts(path_mode);
 	bool capture_cardinality = plan_replay_mode_captures(cardinality_mode);
 	bool replay_cardinality = plan_replay_mode_replays(cardinality_mode);
 
-	if (!capture_paths && !replay_paths &&
+	plan_replay_statement_active = false;
+	if (!capture_paths && !replay_paths && !predict_paths &&
 		!capture_cardinality && !replay_cardinality)
 		return;
+	plan_replay_statement_active = true;
 
 	if (capture_paths)
 		plan_replay_require_absolute_file(plan_replay_path_capture_file,
@@ -2633,11 +1961,9 @@ plan_replay_begin_statement(Query *parse, const char *query_string, int cursor_o
 	plan_replay_cost_replay_entry_count = 0;
 	plan_replay_cost_replay_applied_count = 0;
 	plan_replay_cost_replay_matched_entry_count = 0;
+	plan_replay_online_reset_stats(&plan_replay_current_online_stats);
 	plan_replay_planner_root = NULL;
-	plan_replay_query = parse;
-	plan_replay_query_string = query_string;
-	plan_replay_cursor_options = cursor_options;
-	if (capture_paths || replay_paths)
+	if (capture_paths || replay_paths || predict_paths)
 		plan_replay_create_path_tables(replay_paths);
 
 	if (replay_paths)
@@ -2697,9 +2023,7 @@ plan_replay_abort_statement(void)
 	plan_replay_cardinality_replay_stream = NULL;
 	plan_replay_destroy_path_tables();
 	plan_replay_planner_root = NULL;
-	plan_replay_query = NULL;
-	plan_replay_query_string = NULL;
-	plan_replay_cursor_options = 0;
+	plan_replay_statement_active = false;
 	if (path_capture != NULL)
 		FreeFile(path_capture);
 	if (path_replay != NULL)
@@ -2766,6 +2090,9 @@ plan_replay_finish_statement(void)
 {
 	uint64 unmatched_costs = plan_replay_cost_replay_entry_count -
 		plan_replay_cost_replay_matched_entry_count;
+
+	if (!plan_replay_statement_active)
+		return;
 	plan_replay_finish_file(&plan_replay_path_replay_stream, true, "Path cost",
 					plan_replay_path_sequence, "Path");
 	plan_replay_finish_file(&plan_replay_path_capture_stream, false, "Path cost",
@@ -2782,10 +2109,9 @@ plan_replay_finish_statement(void)
 	plan_replay_last_cost_replay_applied_count =
 		plan_replay_cost_replay_applied_count;
 	plan_replay_last_cost_replay_unmatched_count = unmatched_costs;
+	plan_replay_last_online_stats = plan_replay_current_online_stats;
 	plan_replay_destroy_path_tables();
-	plan_replay_query = NULL;
-	plan_replay_query_string = NULL;
-	plan_replay_cursor_options = 0;
+	plan_replay_statement_active = false;
 }
 
 static void
@@ -2818,12 +2144,16 @@ plan_replay_planner(Query *parse, const char *query_string, int cursor_options,
 {
 	PlannedStmt *result = NULL;
 	bool top_level = plan_replay_planner_depth == 0;
+	instr_time started;
+	instr_time elapsed;
 
+	if (top_level)
+		INSTR_TIME_SET_CURRENT(started);
 	plan_replay_planner_depth++;
 	PG_TRY();
 	{
 		if (top_level)
-			plan_replay_begin_statement(parse, query_string, cursor_options);
+			plan_replay_begin_statement();
 		if (previous_planner_hook != NULL)
 			result = previous_planner_hook(parse, query_string, cursor_options,
 									   bound_params);
@@ -2831,7 +2161,17 @@ plan_replay_planner(Query *parse, const char *query_string, int cursor_options,
 			result = standard_planner(parse, query_string, cursor_options,
 								  bound_params);
 		if (top_level)
+		{
+			bool statement_was_active = plan_replay_statement_active;
+
 			plan_replay_finish_statement();
+			if (statement_was_active)
+			{
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, started);
+				plan_replay_last_planning_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+			}
+		}
 		plan_replay_planner_depth--;
 	}
 	PG_CATCH();
@@ -2849,16 +2189,24 @@ plan_replay_planner(Query *parse, const char *query_string, int cursor_options,
 Datum
 plan_replay_last_timing(PG_FUNCTION_ARGS)
 {
-	char json[384];
+	char json[640];
 
 	snprintf(json, sizeof(json),
-			 "{\"planning_ms\":0,\"execution_ms\":0,\"inference_ms\":0,"
+			 "{\"planning_ms\":%.6f,\"execution_ms\":0,\"inference_ms\":%.6f,"
 			 "\"batches\":" UINT64_FORMAT ",\"paths\":" UINT64_FORMAT
+			 ",\"model_batches\":" UINT64_FORMAT
+			 ",\"model_paths\":" UINT64_FORMAT
+			 ",\"model_applied\":" UINT64_FORMAT
 			 ",\"cost_replay_entries\":" UINT64_FORMAT
 			 ",\"cost_replay_applied\":" UINT64_FORMAT
 			 ",\"cost_replay_unmatched\":" UINT64_FORMAT
 			 ",\"fallbacks\":0}",
+			 plan_replay_last_planning_ms,
+			 plan_replay_last_online_stats.inference_ms,
 			 plan_replay_last_batch_count, plan_replay_last_path_count,
+			 plan_replay_last_online_stats.batches,
+			 plan_replay_last_online_stats.paths,
+			 plan_replay_last_online_stats.applied,
 			 plan_replay_last_cost_replay_entry_count,
 			 plan_replay_last_cost_replay_applied_count,
 			 plan_replay_last_cost_replay_unmatched_count);
@@ -2879,6 +2227,9 @@ plan_replay_reset_stats(PG_FUNCTION_ARGS)
 	plan_replay_last_cost_replay_entry_count = 0;
 	plan_replay_last_cost_replay_applied_count = 0;
 	plan_replay_last_cost_replay_unmatched_count = 0;
+	plan_replay_last_planning_ms = 0;
+	plan_replay_online_reset_stats(&plan_replay_current_online_stats);
+	plan_replay_online_reset_stats(&plan_replay_last_online_stats);
 	PG_RETURN_VOID();
 }
 
@@ -2908,7 +2259,7 @@ _PG_init(void)
 						 NULL,
 						 &plan_replay_cardinality_mode,
 						 PLAN_REPLAY_CHANNEL_INHERIT,
-						 plan_replay_channel_mode_options,
+						 plan_replay_cardinality_mode_options,
 						 PGC_SUSET,
 						 0,
 						 NULL, NULL, NULL);
@@ -2928,14 +2279,6 @@ _PG_init(void)
 						   PGC_SUSET,
 						   0,
 						   NULL, NULL, NULL);
-	DefineCustomBoolVariable("plan_replay.path_capture_verbose",
-						 "Write the legacy verbose Path JSONL format.",
-						 NULL,
-						 &plan_replay_path_capture_verbose,
-						 false,
-						 PGC_SUSET,
-						 0,
-						 NULL, NULL, NULL);
 	DefineCustomStringVariable("plan_replay.cardinality_capture_file",
 						   "Absolute cardinality JSONL output path for one statement.",
 						   NULL,
@@ -2952,6 +2295,7 @@ _PG_init(void)
 						   PGC_SUSET,
 						   0,
 						   NULL, NULL, NULL);
+	plan_replay_online_init();
 
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = plan_replay_set_rel_pathlist;
