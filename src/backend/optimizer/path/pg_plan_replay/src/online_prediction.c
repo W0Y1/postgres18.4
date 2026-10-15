@@ -1,3 +1,4 @@
+/* 在线模型的 Path 序列化、批处理和预测结果应用。 */
 #include "postgres.h"
 
 #include "fmgr.h"

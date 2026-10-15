@@ -1,3 +1,4 @@
+/* online_prediction.c 的扩展内部接口。 */
 #ifndef PG_PLAN_REPLAY_ONLINE_PREDICTION_H
 #define PG_PLAN_REPLAY_ONLINE_PREDICTION_H
 

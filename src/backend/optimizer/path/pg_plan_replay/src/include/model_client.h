@@ -1,3 +1,4 @@
+/* model_client.c 的扩展内部接口。 */
 #ifndef PG_PLAN_REPLAY_MODEL_CLIENT_H
 #define PG_PLAN_REPLAY_MODEL_CLIENT_H
 

@@ -1,3 +1,4 @@
+/* PostgreSQL 后端与本地模型服务之间的 Unix socket 协议客户端。 */
 #include "postgres.h"
 
 #include <errno.h>

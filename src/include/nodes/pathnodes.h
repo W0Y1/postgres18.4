@@ -899,9 +899,12 @@ typedef struct RelOptInfo
 	 */
 	/* estimated number of result tuples */
 	Cardinality rows;
-	/* pg_plan_replay estimate that produced rows, when available */
+	/* pg_plan_replay 生成 rows 的估算；sequence 仅诊断，ID 才是回放键 */
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
+	bool		plan_replay_cardinality_id_valid;
+	uint64		plan_replay_cardinality_id_hi;
+	uint64		plan_replay_cardinality_id_lo;
 
 	/*
 	 * per-relation planner control flags
@@ -1717,9 +1720,12 @@ typedef struct ParamPathInfo
 
 	Relids		ppi_req_outer;	/* rels supplying parameters used by path */
 	Cardinality ppi_rows;		/* estimated number of result tuples */
-	/* pg_plan_replay estimate that produced ppi_rows, when available */
+	/* 当前 required_outer 对应的估算；sequence 仅诊断，ID 才是回放键 */
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
+	bool		plan_replay_cardinality_id_valid;
+	uint64		plan_replay_cardinality_id_hi;
+	uint64		plan_replay_cardinality_id_lo;
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
 	Bitmapset  *ppi_serials;	/* set of rinfo_serial for enforced quals */
 } ParamPathInfo;
@@ -1810,8 +1816,12 @@ typedef struct Path
 	bool		plan_replay_path_id_valid;
 	uint64		plan_replay_path_id_hi;
 	uint64		plan_replay_path_id_lo;
+	/* 该 Path 所表示逻辑结果的基数身份，与物理 Path 身份相互独立 */
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
+	bool		plan_replay_cardinality_id_valid;
+	uint64		plan_replay_cardinality_id_hi;
+	uint64		plan_replay_cardinality_id_lo;
 
 	/* sort ordering of path's output; a List of PathKey nodes; see above */
 	List	   *pathkeys;

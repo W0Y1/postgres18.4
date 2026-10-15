@@ -43,22 +43,40 @@ typedef enum
 typedef enum CardinalityEstimateKind
 {
 	CARDINALITY_ESTIMATE_BASE,
+	CARDINALITY_ESTIMATE_PARAMETERIZED_BASE,
 	CARDINALITY_ESTIMATE_JOIN,
 	CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN
 } CardinalityEstimateKind;
 
+typedef struct CardinalityEstimateContext
+{
+	/* 当前估算对象以及计算原生基数所使用的逻辑输入。 */
+	CardinalityEstimateKind kind;
+	RelOptInfo *rel;
+	RelOptInfo *outer_rel;
+	RelOptInfo *inner_rel;
+	Path	   *outer_path;
+	Path	   *inner_path;
+	SpecialJoinInfo *sjinfo;
+	List	   *restrictlist;
+	Relids		required_outer;
+	Cardinality outer_rows;
+	Cardinality inner_rows;
+	Cardinality native_rows;
+
+	/*
+	 * hook 可填写的输出元数据。sequence 只定位本轮 JSONL 调用，不参与回放
+	 * 匹配；回放只使用 128 位 cardinality_id。
+	 */
+	bool		sequence_valid;
+	uint64		sequence;
+	bool		cardinality_id_valid;
+	uint64		cardinality_id_hi;
+	uint64		cardinality_id_lo;
+} CardinalityEstimateContext;
+
 typedef Cardinality (*cardinality_estimate_hook_type) (PlannerInfo *root,
-														CardinalityEstimateKind kind,
-														RelOptInfo *rel,
-														RelOptInfo *outer_rel,
-														RelOptInfo *inner_rel,
-														SpecialJoinInfo *sjinfo,
-														List *restrictlist,
-														Cardinality outer_rows,
-														Cardinality inner_rows,
-														Cardinality native_rows,
-														bool *sequence_valid,
-														uint64 *sequence);
+														CardinalityEstimateContext *context);
 
 extern PGDLLIMPORT cardinality_estimate_hook_type cardinality_estimate_hook;
 
@@ -218,15 +236,17 @@ extern void compute_semi_anti_join_factors(PlannerInfo *root,
 extern void set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel);
 extern double get_parameterized_baserel_size(PlannerInfo *root,
 											 RelOptInfo *rel,
-											 List *param_clauses);
+											 Relids required_outer,
+											 List *param_clauses,
+											 CardinalityEstimateContext *context);
 extern double get_parameterized_joinrel_size(PlannerInfo *root,
 										 RelOptInfo *rel,
 										 Path *outer_path,
 										 Path *inner_path,
 										 SpecialJoinInfo *sjinfo,
+										 Relids required_outer,
 										 List *restrict_clauses,
-										 bool *sequence_valid,
-										 uint64 *sequence);
+										 CardinalityEstimateContext *context);
 extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 									   RelOptInfo *outer_rel,
 									   RelOptInfo *inner_rel,

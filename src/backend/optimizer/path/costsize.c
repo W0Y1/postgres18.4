@@ -193,9 +193,10 @@ static double calc_joinrel_size_estimate(PlannerInfo *root,
 										 double inner_rows,
 										 SpecialJoinInfo *sjinfo,
 										 List *restrictlist,
-										 bool parameterized,
-										 bool *sequence_valid,
-										 uint64 *sequence);
+										 Path *outer_path,
+										 Path *inner_path,
+										 Relids required_outer,
+										 CardinalityEstimateContext *context);
 static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 													Relids outer_relids,
 													Relids inner_relids,
@@ -5373,17 +5374,20 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 
 	if (cardinality_estimate_hook != NULL)
 	{
-		bool		sequence_valid = false;
-		uint64		sequence = 0;
+		CardinalityEstimateContext context;
 
-		rel->rows = clamp_row_est(cardinality_estimate_hook(root,
-														 CARDINALITY_ESTIMATE_BASE,
-														 rel, NULL, NULL, NULL,
-														 rel->baserestrictinfo,
-														 0, 0, nrows,
-														 &sequence_valid, &sequence));
-		rel->plan_replay_cardinality_sequence_valid = sequence_valid;
-		rel->plan_replay_cardinality_sequence = sequence;
+		/* 先完成 PostgreSQL 原生估算，再允许 hook 替换最终 rows 并附加身份。 */
+		MemSet(&context, 0, sizeof(context));
+		context.kind = CARDINALITY_ESTIMATE_BASE;
+		context.rel = rel;
+		context.restrictlist = rel->baserestrictinfo;
+		context.native_rows = rel->rows;
+		rel->rows = clamp_row_est(cardinality_estimate_hook(root, &context));
+		rel->plan_replay_cardinality_sequence_valid = context.sequence_valid;
+		rel->plan_replay_cardinality_sequence = context.sequence;
+		rel->plan_replay_cardinality_id_valid = context.cardinality_id_valid;
+		rel->plan_replay_cardinality_id_hi = context.cardinality_id_hi;
+		rel->plan_replay_cardinality_id_lo = context.cardinality_id_lo;
 	}
 }
 
@@ -5397,7 +5401,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
  */
 double
 get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
-							   List *param_clauses)
+								Relids required_outer, List *param_clauses,
+								CardinalityEstimateContext *context)
 {
 	List	   *allclauses;
 	double		nrows;
@@ -5417,6 +5422,18 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 							   NULL);
 	nrows = clamp_row_est(nrows);
 	/* For safety, make sure result is not more than the base estimate */
+	if (nrows > rel->rows)
+		nrows = rel->rows;
+
+	/* allclauses 同时含基表过滤和本参数化实际执行的外部参数条件。 */
+	MemSet(context, 0, sizeof(*context));
+	context->kind = CARDINALITY_ESTIMATE_PARAMETERIZED_BASE;
+	context->rel = rel;
+	context->restrictlist = allclauses;
+	context->required_outer = required_outer;
+	context->native_rows = nrows;
+	if (cardinality_estimate_hook != NULL)
+		nrows = clamp_row_est(cardinality_estimate_hook(root, context));
 	if (nrows > rel->rows)
 		nrows = rel->rows;
 	return nrows;
@@ -5451,6 +5468,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist)
 {
+	CardinalityEstimateContext context;
+
 	rel->rows = calc_joinrel_size_estimate(root,
 										   rel,
 										   outer_rel,
@@ -5459,9 +5478,13 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist,
-										   false,
-										   &rel->plan_replay_cardinality_sequence_valid,
-										   &rel->plan_replay_cardinality_sequence);
+										   NULL, NULL, NULL, &context);
+	/* 普通 Join 的语义身份保存在 RelOptInfo，供所有非参数化 Path 复用。 */
+	rel->plan_replay_cardinality_sequence_valid = context.sequence_valid;
+	rel->plan_replay_cardinality_sequence = context.sequence;
+	rel->plan_replay_cardinality_id_valid = context.cardinality_id_valid;
+	rel->plan_replay_cardinality_id_hi = context.cardinality_id_hi;
+	rel->plan_replay_cardinality_id_lo = context.cardinality_id_lo;
 }
 
 /*
@@ -5484,9 +5507,9 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 								Path *outer_path,
 								Path *inner_path,
 								SpecialJoinInfo *sjinfo,
+								Relids required_outer,
 								List *restrict_clauses,
-								bool *sequence_valid,
-								uint64 *sequence)
+								CardinalityEstimateContext *context)
 {
 	double		nrows;
 
@@ -5507,9 +5530,8 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
 									   inner_path->rows,
 									   sjinfo,
 									   restrict_clauses,
-									   true,
-									   sequence_valid,
-									   sequence);
+									   outer_path, inner_path,
+									   required_outer, context);
 	/* For safety, make sure result is not more than the base estimate */
 	if (nrows > rel->rows)
 		nrows = rel->rows;
@@ -5534,9 +5556,10 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 						   double inner_rows,
 						   SpecialJoinInfo *sjinfo,
 						   List *restrictlist,
-						   bool parameterized,
-						   bool *sequence_valid,
-						   uint64 *sequence)
+						   Path *outer_path,
+						   Path *inner_path,
+						   Relids required_outer,
+						   CardinalityEstimateContext *context)
 {
 	List	   *original_restrictlist = restrictlist;
 	JoinType	jointype = sjinfo->jointype;
@@ -5661,15 +5684,22 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 			break;
 	}
 
+	MemSet(context, 0, sizeof(*context));
+	context->kind = outer_path != NULL ?
+		CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN : CARDINALITY_ESTIMATE_JOIN;
+	context->rel = joinrel;
+	context->outer_rel = outer_rel;
+	context->inner_rel = inner_rel;
+	context->outer_path = outer_path;
+	context->inner_path = inner_path;
+	context->sjinfo = sjinfo;
+	context->restrictlist = original_restrictlist;
+	context->required_outer = required_outer;
+	context->outer_rows = outer_rows;
+	context->inner_rows = inner_rows;
+	context->native_rows = nrows;
 	if (cardinality_estimate_hook != NULL)
-		nrows = cardinality_estimate_hook(root,
-										parameterized ?
-										CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN :
-										CARDINALITY_ESTIMATE_JOIN,
-										joinrel, outer_rel, inner_rel, sjinfo,
-										original_restrictlist,
-										outer_rows, inner_rows, nrows,
-										sequence_valid, sequence);
+		nrows = cardinality_estimate_hook(root, context);
 
 	return clamp_row_est(nrows);
 }

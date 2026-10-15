@@ -1551,6 +1551,7 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *eqclauses;
 	Bitmapset  *pserials;
 	double		rows;
+	CardinalityEstimateContext cardinality_context;
 	ListCell   *lc;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
@@ -1614,12 +1615,26 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	}
 
 	/* Estimate the number of rows returned by the parameterized scan */
-	rows = get_parameterized_baserel_size(root, baserel, pclauses);
+	rows = get_parameterized_baserel_size(root, baserel, required_outer,
+										  pclauses, &cardinality_context);
 
 	/* And now we can build the ParamPathInfo */
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
+	/*
+	 * 参数化基表的 ID 不能写入共享 RelOptInfo，否则会覆盖普通基表或另一组
+	 * required_outer 的身份；它和行数一起归属于当前 ParamPathInfo。
+	 */
+	ppi->plan_replay_cardinality_sequence_valid =
+		cardinality_context.sequence_valid;
+	ppi->plan_replay_cardinality_sequence = cardinality_context.sequence;
+	ppi->plan_replay_cardinality_id_valid =
+		cardinality_context.cardinality_id_valid;
+	ppi->plan_replay_cardinality_id_hi =
+		cardinality_context.cardinality_id_hi;
+	ppi->plan_replay_cardinality_id_lo =
+		cardinality_context.cardinality_id_lo;
 	ppi->ppi_clauses = pclauses;
 	ppi->ppi_serials = pserials;
 	baserel->ppilist = lappend(baserel->ppilist, ppi);
@@ -1671,8 +1686,7 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	List	   *eclauses;
 	List	   *dropped_ecs;
 	double		rows;
-	bool		sequence_valid = false;
-	uint64		sequence = 0;
+	CardinalityEstimateContext cardinality_context;
 	ListCell   *lc;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
@@ -1825,9 +1839,9 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 										  outer_path,
 										  inner_path,
 										  sjinfo,
+										  required_outer,
 										  *restrict_clauses,
-										  &sequence_valid,
-										  &sequence);
+										  &cardinality_context);
 
 	/*
 	 * And now we can build the ParamPathInfo.  No point in saving the
@@ -1839,8 +1853,16 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
-	ppi->plan_replay_cardinality_sequence_valid = sequence_valid;
-	ppi->plan_replay_cardinality_sequence = sequence;
+	/* 参数化 Join 同理按 required_outer 缓存在自己的 ParamPathInfo 中。 */
+	ppi->plan_replay_cardinality_sequence_valid =
+		cardinality_context.sequence_valid;
+	ppi->plan_replay_cardinality_sequence = cardinality_context.sequence;
+	ppi->plan_replay_cardinality_id_valid =
+		cardinality_context.cardinality_id_valid;
+	ppi->plan_replay_cardinality_id_hi =
+		cardinality_context.cardinality_id_hi;
+	ppi->plan_replay_cardinality_id_lo =
+		cardinality_context.cardinality_id_lo;
 	ppi->ppi_clauses = NIL;
 	ppi->ppi_serials = NULL;
 	joinrel->ppilist = lappend(joinrel->ppilist, ppi);

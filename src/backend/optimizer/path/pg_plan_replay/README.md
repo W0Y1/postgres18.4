@@ -1,29 +1,74 @@
 # pg_plan_replay 采集、稳定 ID 回放与在线代价预测
 
+## RCA 精简捕获
+
+RCA 使用 Path capture v9；不再生成或读取 `cardinality.jsonl`。`observation.c`、
+`plan_replay.observe`、两个 EXPLAIN 回调及 watch GUC 已移除；本次变更没有
+增加或修改 PostgreSQL 内核接口。
+
+- `paths.jsonl` 只记录候选 `path_id`、`parallel_workers` 和必要的
+  `partial` / 代价注入 / 剪枝命中标志。leader 配置在每段文件头保存一次。
+- 基数 ID 与实际行数来自 EXPLAIN；注入是否全部命中由同次规划的
+  `cardinality_replay_entries` / `cardinality_replay_unmatched` 确认。
+- 不输出子路径、父子 ID、依赖图、条件文本、关系名称或重复的 rows/cost。
+  Agent 从 EXPLAIN 的 `Plans` 树确定可见节点的恢复顺序与祖先关系。
+- Agent 流式读取文件，仅保留最终计划和本轮指定 ID 的信息；原始捕获文件
+  不进入 LLM 输入。节点行数除数由 Agent 按同次规划的并行信息计算。
+
+Path 通道无干预时使用 `capture`；代价注入时使用 `capture_replay`，剪枝时使用
+`capture_prune`。基数通道无干预时使用 `off`，注入时使用 `replay`。原有 `.rows` format=2、`.costs` format=3、
+`.prunes` format=2 输入协议和稳定 ID 算法保持不变。
+
+## 捕获与回放模式
+
 离线采集和回放不需要推理服务。在线 Path 代价预测通过独立 Python 服务完成。
 `plan_replay.mode` 保留为同时控制两个离线通道的兼容入口；需要独立实验、迭代采集
 或在线预测时使用 `plan_replay.path_mode` 和
 `plan_replay.cardinality_mode`：
 
-- Path 代价协议：采集候选 `Path` 树，以 128 位稳定 Path ID 稀疏回放
-  `startup_cost` 和 `total_cost`；候选出现顺序只用于诊断。
-- 基数协议：采集基础表和连接的基数估计输入，按估计调用顺序回放 `rows`。
+- Path 协议：采集候选 ID、并行口径和命中记录，以 128 位稳定 Path ID 稀疏回放
+  `startup_cost` 和 `total_cost`，或直接剪掉指定候选；候选出现顺序只用于诊断。
+- 基数协议：计算普通/参数化基表和连接的逻辑基数身份，以 128 位稳定
+  `cardinality_id` 稀疏回放 `rows`；估计调用顺序只用于诊断。
 
-两个通道都支持 `inherit`、`off`、`capture`、`replay` 和 `capture_replay`；
-Path 通道另外支持 `predict` 和 `capture_predict`。默认 `inherit` 继承
-`plan_replay.mode`。`capture_replay` 在同一次
-规划中读取上一轮 replay 文件，并把本轮最终生效的值写入新的 JSONL；capture 与
-replay 文件必须使用不同的绝对路径。
+Path 通道支持 `inherit`、`off`、`capture`、`replay`、`capture_replay`、
+`predict`、`capture_predict`、`prune` 和 `capture_prune`。
+基数通道只支持 `inherit`、`off` 和 `replay`；已移除该通道的
+`capture`、`capture_replay` 以及 `cardinality_capture_file` 设置。
+默认 `inherit` 继承 `plan_replay.mode` 的回放状态。
+只要 Path 通道启用，或进行基数回放，就计算基数 ID 并传递给 EXPLAIN；
+基数通道设为 `off` 不会阻止 Path 采集时生成基数 ID。
+Path 的 `capture_replay` 同时读取 replay 文件并追加 JSONL；两个文件必须使用不同绝对路径。
 
 典型迭代配置如下：
 
 | 实验 | `path_mode` | `cardinality_mode` |
 |---|---|---|
-| 仅基数注入 | `capture` | `capture_replay` |
-| 仅代价注入 | `capture_replay` | `capture` |
-| 联合注入 | `capture_replay` | `capture_replay` |
+| 仅基数注入 | `capture` | `replay` |
+| 仅代价注入 | `capture_replay` | `off` |
+| 联合注入 | `capture_replay` | `replay` |
 
 ## 编译与安装
+
+目录按运行职责划分：
+
+```text
+pg_plan_replay/
+├── Makefile、README.md、control、扩展 SQL
+├── src/
+│   ├── pg_plan_replay.c
+│   ├── cardinality_identity.c
+│   ├── online_prediction.c
+│   ├── model_client.c
+│   └── include/                 # C 端内部头文件
+├── build/                       # PGXS 生成物，已被 .gitignore 整体忽略
+├── service/                     # Python 在线模型服务
+├── tests/                       # Python 单元测试
+└── tools/                       # capture/replay 转换工具
+```
+
+根目录 Makefile 会在 `build/` 中递归执行 PGXS，所以 `.o`、LLVM `.bc` 和
+`pg_plan_replay.so` 都不会写入源码目录：
 
 ```bash
 make PG_CONFIG=/home/pgdev/postgresql-18.4/Debug/install/bin/pg_config
@@ -32,9 +77,10 @@ make install PG_CONFIG=/home/pgdev/postgresql-18.4/Debug/install/bin/pg_config
 
 ## 在线模型代价预测
 
-C 端按职责拆成三层：`pg_plan_replay.c` 只负责模式、离线通道和 planner 生命周期；
-`online_prediction.c` 负责模型 Path 序列化、固定批量、原子代价应用及推理统计；
-`model_client.c` 只负责 Unix socket 收发和顺序 costs 数组解析。
+C 端按职责拆分：`src/pg_plan_replay.c` 负责模式、离线通道和 planner 生命周期；
+`src/cardinality_identity.c` 负责逻辑基数身份；`src/online_prediction.c` 负责模型
+Path 序列化、固定批量、原子代价应用及推理统计；`src/model_client.c` 只负责
+Unix socket 收发和顺序 costs 数组解析。
 
 ### 代码与模型资产边界
 
@@ -222,71 +268,45 @@ collator 和训练数据，而不是只扩展请求 JSON。
 ```sql
 LOAD 'pg_plan_replay';
 SET plan_replay.path_capture_file = '/home/pgdev/postgresql-18.4/src/backend/optimizer/path/pg_plan_replay/test/query.paths.jsonl';
-SET plan_replay.cardinality_capture_file = '/home/pgdev/postgresql-18.4/src/backend/optimizer/path/pg_plan_replay/test/cardinality.jsonl';
 SET plan_replay.mode = 'capture';
 EXPLAIN ANALYZE SELECT * FROM pg_catalog.pg_class;
 SET plan_replay.mode = 'off';
 ```
 
-开始规划顶层语句时，采集文件会被清空。默认使用紧凑格式 v6，每一行对应一个
-候选 Path，并带有从 0 开始的 `sequence` 序号：
+捕获采用追加方式，每次规划写入一段完整的 `header → 记录 → end`。
+每次实验应使用新的文件路径；Agent 为每次规划和执行分别创建新目录。
+执行期间的嵌套 SQL 规划追加后续段，Agent 使用第一段对应外层 EXPLAIN 的证据，
+避免内层规划覆盖外层记录。缺少结束标记或记录数量不符会被拒绝。
 
-```json
-{
-  "format_version": 6,
-  "sequence": 0,
-  "path_id": "7ddc6720f8e6eec1354813d528c9d1f3",
-  "cost_replay_applied": false,
-  "model_prediction_applied": false,
-  "cost_source": "native",
-  "native_startup_cost": 0,
-  "native_total_cost": 20.225,
-  "effective_startup_cost": 0,
-  "effective_total_cost": 20.225,
-  "cardinality_sequence": 0,
-  "partial": false,
-  "relids": [1],
-  "path": {
-    "op_name": "Seq Scan",
-    "startup_cost": 0,
-    "total_cost": 20.225,
-    "rows": 150,
-    "width": 4,
-    "pathkeys": 0,
-    "parallel_aware": false,
-    "parallel_workers": 0,
-    "relids": [1],
-    "relations": [
-      {"rti": 1, "alias": "c", "schema": "pg_catalog", "table": "pg_class"}
-    ],
-    "children": []
-  }
-}
+Path v9 的文件头及普通候选记录示例：
+
+```jsonl
+{"record":"header","format_version":9,"path_id_version":2,"parallel_leader_participation":true}
+{"path_id":"7ddc6720f8e6eec1354813d528c9d1f3","parallel_workers":0}
 ```
 
-根记录的 `native_startup_cost` 和 `native_total_cost` 是本轮回放前 PostgreSQL
-计算的值；`path.startup_cost` 和 `path.total_cost` 是回放后最终生效的值。普通
-capture 中两组值相同。`cost_replay_applied` 表示本候选是否命中了稀疏代价文件。
-`path_id` 是当前物理 Path 的 128 位稳定 ID。`path` 会递归记录子 Path。索引 Path
-额外包含 `index_name`，连接 Path 额外包含
-`join_type`。当前格式不重复输出查询文本、所有 planner GUC、全表列定义、
-`RelOptInfo`、`PathTarget`、`raw_query`、`raw_path` 和节点专属内部 dump。
-过滤条件和连接条件属于独立的基数采集协议，不在 Path 代价文件中重复记录。
+一个候选还可能带有 `partial:true`、`cost_replay_applied:true`、
+`path_prune_applied:true`；省略表示 false。同一 ID 的并行信息只保存一次，
+若后续命中标志增加则追加累计更新记录，读取端按 ID 合并。结束记录包含
+`record:"end"`、实际写入的 `records` 数和该次规划的 `stats`。
+`stats.paths` 是所有候选处理次数，可以大于去重后的记录数。
 
-启用采集或回放时，每个候选 Path 都记录稳定 ID 和两个独立序列号：
+基数通道没有输出文件。Path 段尾 `stats` 保留同次规划的基数回放统计：
+`entries` 为加载的唯一 ID 数，`unmatched` 为未命中的唯一 ID 数，`applied` 为命中的估计调用次数。
+确认全部注入生效需要 `entries` 等于输入条目数且 `unmatched=0`；不能用调用次数代替命中 ID 数。
+部分命中时统计只提供数量，不返回具体未命中的 ID。
 
-- `path_id`：跨轮匹配代价；由 Path 类型、关系身份、参数化、完整排序语义、
-  并行属性、类型专属属性和递归子 Path ID 计算。
-- `sequence`：本轮候选 Path 序号，只对应 Path JSONL 行序和诊断信息。
-- `cardinality_sequence`：生成该 Path 行数估计的序号，对应 cardinality JSONL 和
-  `.rows` 的行号；没有对应基数估计时为 `null`。
+EXPLAIN 继续输出最终计划的 `Plan Replay Path ID` 和 `Plan Replay Cardinality ID`。
+没有独立 Path 回放入口的包装节点不被当作恢复目标。恢复范围限定为 EXPLAIN
+可见且带 ID 的节点，不重建被合并或隐藏的候选 Path 图。
 
-这些标识会传递到由该 Path 生成的最终 Plan 节点。`EXPLAIN ANALYZE` 文本格式
-显示 `plan_replay_path_id=...`、`plan_replay_sequence=N` 和
-`plan_replay_cardinality_sequence=N`，JSON 格式显示 `"Plan Replay Path ID"`、
-`"Plan Replay Sequence": N` 和
-`"Plan Replay Cardinality Sequence": N`。规划器额外插入、没有直接对应 Path 的
-Plan 节点不会显示相应字段。
+`parallel_workers` 是规划时 Path 的 worker 数。行数除数 D 为：workers=0 时 1；
+否则 leader 不参与时为 workers，参与时为 workers + max(0, 1−0.3×workers)。
+Agent 使用 Actual Rows × D，不乘 loops；不能把 D 当作实际进程数或精确总行数。
+
+Path ID v2 使用明确的 PathKey/EC 语义序列化：表达式、成员类型、运算族、collation、方向、NULL 顺序；不序列化整个 EC 的派生条件与估价缓存。保留参数化条件、索引、连接条件及子 Path 身份。ID 描述符在语句上下文中分配，GEQO 释放临时 tour 上下文后仍有效。
+
+`.costs` format 3、`.prunes` format 2 与 ID v2 配套，旧版本明确拒绝，必须重新采集；基数协议不变。`plan_replay_last_timing()` 同时公布 ID、Path capture、cost、prune 和 rows 版本（`rows_format=2`），供 Agent 能力检查。历史文件不自动升级或覆盖。
 
 ID 使用 SHA-256 的前 128 位。描述符明确排除 cost、rows、selectivity、真实执行
 时间、sequence、列表位置和内存地址。Join 的 outer/inner 子 Path 顺序保留，
@@ -300,7 +320,6 @@ BitmapAnd/BitmapOr 的子 ID 排序后再参与计算。同一规划中会保存
 ```sql
 LOAD 'pg_plan_replay';
 SET plan_replay.path_capture_file = '/home/pgdev/postgresql-18.4/src/backend/optimizer/path/pg_plan_replay/test/query.paths.jsonl';
-SET plan_replay.cardinality_capture_file = '/home/pgdev/postgresql-18.4/src/backend/optimizer/path/pg_plan_replay/test/cardinality.jsonl';
 SET plan_replay.mode = 'capture';
 
 \pset format unaligned
@@ -316,51 +335,51 @@ SET plan_replay.mode = 'off';
 
 `BUFFERS OFF` 去掉当前任务不需要的 buffer/block 字段。这样一次执行会得到：
 
-- `query.paths.jsonl`：所有候选 Path 的原始基数和代价估计。
-- `cardinality.jsonl`：基础关系、普通连接和参数化连接的原始基数估计。
+- `query.paths.jsonl`：候选 Path 的 ID、并行信息与命中标志。
 - `query.explain.json`：最终执行计划节点的真实行数和执行时间。
 
 `query.explain.json` 中的 `Plan Replay Path ID` 可直接作为稀疏 `.costs` 的键。
 把最终计划节点的 `Actual Startup Time`、`Actual Total Time` 连同这个 ID 写入
-`.costs`。`Plan Replay Sequence` 仍可定位该轮 `query.paths.jsonl`，但不能用于
-跨轮代价匹配。按照当前实验约定，真实时间与 PostgreSQL cost 不做额外单位换算。
+`.costs`。`Plan Replay Sequence` 仅为诊断序号，不再对应去重后的 JSONL 行号，
+也不能用于跨轮代价匹配。按照当前实验约定，真实时间与 PostgreSQL cost 不做额外单位换算。
 
-`Plan Replay Cardinality Sequence` 可以直接定位 `cardinality.jsonl` 和 `.rows`
-中对应的基数估计，不再需要按关系集合、连接类型或计划树位置做启发式匹配。生成真实
-`.rows` 时，把该节点的 `Actual Rows` 写入对应序号的行即可。`Actual Rows` 是每次
-loop 的平均输出行数，这与规划器的节点行数语义一致，因此注入基数时不要乘以
-`Actual Loops`。
+`Plan Replay Cardinality ID` 是稀疏 `.rows` 的键；把该节点的 `Actual Rows` 与
+ID 追加到 `.rows`；并行节点按上述 D 换算。`Plan Replay Cardinality Sequence`
+仅为同轮诊断序号，不参与跨轮匹配。`Actual Rows` 是每次 loop 的平均输出行数，这与规划器的节点行数
+语义一致，因此注入基数时不要乘以 `Actual Loops`。
 
-当前基数 hook 覆盖基础关系、普通连接和参数化连接。参数化基础关系以及 Aggregate、
-Limit 等上层节点没有独立的基数采集记录，因此相应 Path 和 Plan 节点不会显示
-cardinality 序列号；不能为这类节点凭空改写 `.rows`。
+当前基数 hook 覆盖普通基表、参数化基表、普通连接和参数化连接。Aggregate、Limit
+等 upper relation 不在该 hook 范围内，不能为这类节点凭空改写 `.rows`。
 
 ## 生成回放文件
 
-采集完成后，使用附带的 Python 工具把两个 JSONL 分别转换成 `.costs` 和
-`.rows`：
+采集完成后，使用附带的 Python 工具检查 Path JSONL 并初始化空稀疏输入：
 
 ```bash
-python3 tools/jsonl_to_replay.py \
-  test/query.paths.jsonl \
-  test/cardinality.jsonl
+python3 tools/jsonl_to_replay.py test/query.paths.jsonl
 ```
 
-默认生成 `test/query.costs` 和 `test/cardinality.rows`。需要自定义位置时使用
-`--costs-output` 和 `--rows-output`。工具会检查 JSON 格式、连续的 `sequence`、
-稳定 Path ID、数值范围以及 `startup_cost <= total_cost`，验证全部通过后才写出
-文件。由于 Path JSONL 本身不知道哪些候选进入了最终执行计划，工具只初始化带格式
-头的空稀疏 `.costs`；生成真实代价文件的调用方应从 EXPLAIN 取最终节点的 ID 和
-实际时间，并只追加这些节点。
+默认生成 `test/query.costs` 和 `test/query.rows`。需要自定义位置时使用
+`--costs-output` 和 `--rows-output`。调用方从 EXPLAIN 取最终节点的 ID 与真实值，
+并按并行口径换算 rows，再追加所需条目。工具仍可接受第二个历史基数 JSONL 参数，
+仅用于读取已有旧产物；当前插件不再生成该文件。
 
 ## 统一回放
 
-代价回放使用 format 2 稀疏文件，只保存具有真实代价的最终计划节点：
+代价回放使用 format 3 稀疏文件，只保存具有真实代价的最终计划节点：
 
 ```text
-# pg_plan_replay_costs format=2
+# pg_plan_replay_costs format=3
 7ddc6720f8e6eec1354813d528c9d1f3 0.006 0.193
 a1c23e5c2c978813f737dac41d99cd19 0.244 0.303
+```
+
+基数回放同样使用 format 2 稀疏文件：
+
+```text
+# pg_plan_replay_cardinalities format=2
+4e92e2232e88c62a94f859de00a8d0e4 61559
+b5ac0df6711fd014ca85265ce0ea91c8 12936
 ```
 
 然后在相同的规划器环境下执行同一条语句：
@@ -384,39 +403,65 @@ Merge Join、Material/Memoize、Sort/Aggregate/Limit、Append/MergeAppend 和
 Gather/Gather Merge。遇到其他 Path 类型会 fail closed 并报告不支持，避免静默
 产生不完整身份。
 
-## 基数文件
+## 按稳定 Path ID 剪枝
 
-基数 JSONL 每行对应一次基数估计调用，并包含从 0 开始的 `sequence`。格式 v2
-同时包含回放前的 `native_rows` 和最终生效的 `effective_rows`；转换脚本优先使用
-`effective_rows`，旧格式没有该字段时仍使用 `native_rows`。`kind`
-有三种取值：
-
-- `base`：基础关系估计，记录原始表行数 `table_tuples`、原生估计
-  `native_rows`、关系身份和实际参与估计的 `filter_clause`。
-- `join`：普通连接关系估计，记录连接类型、两侧 relids、关系别名、两侧实际输入
-  `outer_rows`/`inner_rows`、原生输出估计和 `join_clause`。
-- `parameterized_join`：参数化连接估计。字段与 `join` 相同，但两侧行数来自本次
-  被估价的具体 Path，而不一定等于 RelOptInfo 的普通行数。
-
-`filter_clause` 和 `join_clause` 都是数组。每个元素包含可读的 `expression`、
-PostgreSQL 内部表示 `raw` 和该条件依赖的 `required_relids`。其中
-`join_clause` 直接来自 PostgreSQL 本次连接基数计算实际接收的 `restrictlist`，
-因此也覆盖外连接场景下在该层应用的 pushed-down 条件。
-
-基数回放文件必须按 JSONL 中的 `sequence` 顺序，为每次估计提供且仅提供一个值：
+剪枝用于验证“优化器是否把更好的候选误排序并淘汰”，不会改写任何 cost。输入文件
+是稀疏的稳定物理 Path ID 集合：
 
 ```text
-rows
+# pg_plan_replay_prune format=2
+2430f875713b39682743c9a3516729ed
 ```
 
-`rows` 必须是有限的非负数。缺行、多行、非法数字都会使当前规划立即报错。
-PostgreSQL 原生的 `clamp_row_est()` 仍会在 hook 返回后执行，因此除允许为 0 的
-特殊情况外，最终参与后续规划的估计至少为 1。
+`prune` 只执行剪枝；`capture_prune` 还会写出精简候选 JSONL，并在命中的原始候选上
+记录 `"path_prune_applied": true`。剪枝发生在候选批次计算稳定 ID 之后、进入原生
+`add_path()`/`add_partial_path()` 代价竞赛之前。普通和 partial 候选分别处理，因此
+可以准确剪掉并行计划使用的 partial Path，而不需要关闭某一整类 Join 方法。
+
+```sql
+LOAD 'pg_plan_replay';
+SET plan_replay.path_mode = 'capture_prune';
+SET plan_replay.cardinality_mode = 'off';
+SET plan_replay.path_prune_file = '/absolute/path/query.prune';
+SET plan_replay.path_capture_file = '/absolute/path/query.pruned.paths.jsonl';
+EXPLAIN (FORMAT JSON) SELECT ...;
+SELECT plan_replay_last_timing();
+```
+
+剪枝文件必须使用绝对路径。重复 ID、非法 ID、缺少 header、额外列和空数据行都会
+立即报错。未出现的 ID 不影响规划，并计入 `path_prune_unmatched`；命中次数记录在
+`path_prune_applied`，同一 ID 若在候选生成中出现多次会全部剪掉。若剪掉了关系的
+全部可行 Path，PostgreSQL 会按原生行为报告无法生成计划。
+
+## 基数文件
+
+基数 capture v4 每条数据记录对应一次基数估计调用，仅包含 `cardinality_id`
+和可选的 `cardinality_replay_applied:true`。文件头和结束记录说明见“统一采集”。
+基表、参数化基表、普通连接、参数化连接均继续经过原有基数 hook，完整逻辑状态
+仍参与稳定身份计算，但条件、原生估计值、关系别名和内部 dump 不再写入文件。
+
+`cardinality_id` 是 `SHA256(canonical logical state)[0:128]`。状态包括查询层级、
+RTI/RTE/OID、完整累计条件、EC 规范等价条件、外连接或 Semi/Anti 的左右语义、
+参数化来源以及有绑定值的 `PARAM_EXTERN`；排除 rows、cost、width、sequence、物理
+Join 方法和 Path 属性。普通 INNER Join 只合并排序去重后的关系/条件 token，因此
+同一完整条件不受连接拆分、outer/inner 物理方向或 Nested Loop/Hash/Merge 方法影响。
+
+基数回放文件以稳定 ID 为键，未列出的估计保留 PostgreSQL 原生值：
+
+```text
+# pg_plan_replay_cardinalities format=2
+32_lowercase_hex_cardinality_id rows
+```
+
+同一 ID 可命中多次调用。重复 ID、非法/大写 ID、负数、非有限值、缺失 header 和
+旧的一列顺序格式都会立即报错。`rows` 仍经过 PostgreSQL 的 `clamp_row_est()`；
+参数化估计还保留“不超过对应普通关系估计”的核心约束。遇到无法取得实际值的
+`PARAM_EXTERN` 时，replay 会拒绝规划，避免错误命中另一组参数值。
 
 这部分移植自 PostgreSQL 13.1 实验代码，但针对 PostgreSQL 18.4 做了接口适配：
-没有保留固定长度数组、全局手工序号和工作目录相对文件，而是通过一个窄的核心 hook
-交给 `pg_plan_replay` 逐行读写；同时区分普通连接与参数化连接，并补充原实现缺少的
-`join_clause`。
+没有保留固定长度数组或工作目录相对文件，而是通过上下文化核心 hook 传递关系、输入
+Path、`SpecialJoinInfo`、当前 `restrictlist` 和 `required_outer`。`sequence` 仅保留
+为同轮诊断信息，不参与 replay。
 
 ## 测试产物
 
@@ -425,7 +470,6 @@ PostgreSQL 原生的 `clamp_row_est()` 仍会在 hook 返回后执行，因此�
 ```text
 src/backend/optimizer/path/pg_plan_replay/test/<case>.paths.jsonl
 src/backend/optimizer/path/pg_plan_replay/test/<case>.costs
-src/backend/optimizer/path/pg_plan_replay/test/<case>.cardinality.jsonl
 src/backend/optimizer/path/pg_plan_replay/test/<case>.rows
 ```
 
@@ -437,4 +481,16 @@ src/backend/optimizer/path/pg_plan_replay/test/<case>.rows
 `model_applied` 和 `fallbacks` 记录在线预测工作。
 `plan_replay_reset_stats()` 用于清空这些统计信息。返回结果还包含
 `cost_replay_entries`、`cost_replay_applied` 和 `cost_replay_unmatched`，分别表示
-稀疏文件中的 ID 数、当前候选命中次数以及本轮未出现的文件 ID 数。
+稀疏文件中的 ID 数、当前候选命中次数以及本轮未出现的文件 ID 数；对应的
+`cardinality_replay_entries`、`cardinality_replay_applied` 和
+`cardinality_replay_unmatched` 提供基数回放统计。
+
+## 身份回归测试
+
+扩展构建完成后，可构建未安装的测试模块并在独立连接执行：
+
+```bash
+make -C tests PG_CONFIG=/home/pgdev/postgresql-18.4/Debug/install/bin/pg_config
+```
+
+使用 `CREATE FUNCTION pg_temp.identity_test() RETURNS boolean AS '<绝对路径>/tests/pg_plan_replay_identity_test', 'plan_replay_identity_test' LANGUAGE C; SELECT pg_temp.identity_test();` 验证估价和 EC 缓存不改变 ID，真实表达式、类型、排序、参数化和条件改变 ID，以及 GEQO 临时上下文释放后的描述符存活。测试模块不安装、不在生产连接加载。

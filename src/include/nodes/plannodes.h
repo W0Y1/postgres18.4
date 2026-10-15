@@ -204,8 +204,12 @@ typedef struct Plan
 	bool		plan_replay_path_id_valid;
 	uint64		plan_replay_path_id_hi;
 	uint64		plan_replay_path_id_lo;
+	/* 从最终选中 Path 传播而来；sequence 仅用于关联同轮 capture 记录 */
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
+	bool		plan_replay_cardinality_id_valid;
+	uint64		plan_replay_cardinality_id_hi;
+	uint64		plan_replay_cardinality_id_lo;
 	/* target list to be computed at this node */
 	List	   *targetlist;
 	/* implicitly-ANDed qual conditions */

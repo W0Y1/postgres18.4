@@ -54,6 +54,7 @@ path_cost_model_batch_hook_type path_cost_model_batch_hook = NULL;
 
 static void add_path_native(RelOptInfo *parent_rel, Path *new_path);
 static void add_partial_path_native(RelOptInfo *parent_rel, Path *new_path);
+static void copy_path_cardinality_identity(Path *path);
 
 static List *translate_sub_tlist(List *tlist, int relid);
 static int	append_total_cost_compare(const ListCell *a, const ListCell *b);
@@ -265,7 +266,7 @@ flush_path_cost_model(RelOptInfo *parent_rel)
 	if (paths != NIL)
 	{
 		if (path_cost_model_batch_hook != NULL)
-			path_cost_model_batch_hook(parent_rel, paths, false);
+			paths = path_cost_model_batch_hook(parent_rel, paths, false);
 		parent_rel->path_cost_model_pending = NIL;
 		foreach(cell, paths)
 			add_path_native(parent_rel, (Path *) lfirst(cell));
@@ -276,11 +277,52 @@ flush_path_cost_model(RelOptInfo *parent_rel)
 	if (paths != NIL)
 	{
 		if (path_cost_model_batch_hook != NULL)
-			path_cost_model_batch_hook(parent_rel, paths, true);
+			paths = path_cost_model_batch_hook(parent_rel, paths, true);
 		parent_rel->partial_path_cost_model_pending = NIL;
 		foreach(cell, paths)
 			add_partial_path_native(parent_rel, (Path *) lfirst(cell));
 		list_free(paths);
+	}
+}
+
+/*
+ * 在原生 Path 剪枝前把关系级基数身份复制到每个 Path。参数化 Path 使用
+ * ParamPathInfo 中的估算；其余 Path 使用父 RelOptInfo 的普通估算。这样不同
+ * 物理实现（Nest/Hash/Merge）只要表示同一逻辑结果，就携带同一个基数 ID。
+ */
+static void
+copy_path_cardinality_identity(Path *path)
+{
+	path->plan_replay_cardinality_sequence_valid = false;
+	path->plan_replay_cardinality_sequence = 0;
+	path->plan_replay_cardinality_id_valid = false;
+	path->plan_replay_cardinality_id_hi = 0;
+	path->plan_replay_cardinality_id_lo = 0;
+	if (path->param_info != NULL)
+	{
+		path->plan_replay_cardinality_sequence_valid =
+			path->param_info->plan_replay_cardinality_sequence_valid;
+		path->plan_replay_cardinality_sequence =
+			path->param_info->plan_replay_cardinality_sequence;
+		path->plan_replay_cardinality_id_valid =
+			path->param_info->plan_replay_cardinality_id_valid;
+		path->plan_replay_cardinality_id_hi =
+			path->param_info->plan_replay_cardinality_id_hi;
+		path->plan_replay_cardinality_id_lo =
+			path->param_info->plan_replay_cardinality_id_lo;
+	}
+	else if (path->parent != NULL)
+	{
+		path->plan_replay_cardinality_sequence_valid =
+			path->parent->plan_replay_cardinality_sequence_valid;
+		path->plan_replay_cardinality_sequence =
+			path->parent->plan_replay_cardinality_sequence;
+		path->plan_replay_cardinality_id_valid =
+			path->parent->plan_replay_cardinality_id_valid;
+		path->plan_replay_cardinality_id_hi =
+			path->parent->plan_replay_cardinality_id_hi;
+		path->plan_replay_cardinality_id_lo =
+			path->parent->plan_replay_cardinality_id_lo;
 	}
 }
 
@@ -513,6 +555,8 @@ add_path_native(RelOptInfo *parent_rel, Path *new_path)
 	List	   *new_path_pathkeys;
 	ListCell   *p1;
 
+	copy_path_cardinality_identity(new_path);
+
 	/*
 	 * This is a convenient place to check for query cancel --- no part of the
 	 * planner goes very long without calling add_path().
@@ -731,9 +775,10 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			List *paths = list_make1(new_path);
 
 			if (path_cost_model_batch_hook != NULL)
-				path_cost_model_batch_hook(parent_rel, paths, false);
+				paths = path_cost_model_batch_hook(parent_rel, paths, false);
+			if (paths != NIL)
+				add_path_native(parent_rel, (Path *) linitial(paths));
 			list_free(paths);
-			add_path_native(parent_rel, new_path);
 			return;
 		}
 
@@ -881,6 +926,8 @@ add_partial_path_native(RelOptInfo *parent_rel, Path *new_path)
 	int			insert_at = 0;	/* where to insert new item */
 	ListCell   *p1;
 
+	copy_path_cardinality_identity(new_path);
+
 	/* Check for query cancel. */
 	CHECK_FOR_INTERRUPTS();
 
@@ -1001,9 +1048,10 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 			List *paths = list_make1(new_path);
 
 			if (path_cost_model_batch_hook != NULL)
-				path_cost_model_batch_hook(parent_rel, paths, true);
+				paths = path_cost_model_batch_hook(parent_rel, paths, true);
+			if (paths != NIL)
+				add_partial_path_native(parent_rel, (Path *) linitial(paths));
 			list_free(paths);
-			add_partial_path_native(parent_rel, new_path);
 			return;
 		}
 
@@ -4782,6 +4830,12 @@ do { \
 			old_ppi->plan_replay_cardinality_sequence_valid;
 		new_ppi->plan_replay_cardinality_sequence =
 			old_ppi->plan_replay_cardinality_sequence;
+		new_ppi->plan_replay_cardinality_id_valid =
+			old_ppi->plan_replay_cardinality_id_valid;
+		new_ppi->plan_replay_cardinality_id_hi =
+			old_ppi->plan_replay_cardinality_id_hi;
+		new_ppi->plan_replay_cardinality_id_lo =
+			old_ppi->plan_replay_cardinality_id_lo;
 		new_ppi->ppi_clauses = old_ppi->ppi_clauses;
 		ADJUST_CHILD_ATTRS(new_ppi->ppi_clauses);
 		new_ppi->ppi_serials = bms_copy(old_ppi->ppi_serials);

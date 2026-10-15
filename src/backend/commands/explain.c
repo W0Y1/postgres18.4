@@ -1823,6 +1823,20 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainPropertyUInteger("Plan Replay Cardinality Sequence", NULL,
 									plan->plan_replay_cardinality_sequence, es);
 	}
+	if (plan->plan_replay_cardinality_id_valid)
+	{
+		char		cardinality_id[33];
+
+		snprintf(cardinality_id, sizeof(cardinality_id),
+				 "%016" PRIx64 "%016" PRIx64,
+				 plan->plan_replay_cardinality_id_hi,
+				 plan->plan_replay_cardinality_id_lo);
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str, " (plan_replay_cardinality_id=%s)",
+							 cardinality_id);
+		else
+			ExplainPropertyText("Plan Replay Cardinality ID", cardinality_id, es);
+	}
 
 	if (es->costs)
 	{

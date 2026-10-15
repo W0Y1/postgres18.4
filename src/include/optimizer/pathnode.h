@@ -18,11 +18,15 @@
 #include "nodes/pathnodes.h"
 
 
-/* Optional relation-local processing before native Path cost pruning. */
+/*
+ * Optional relation-local processing before native Path cost pruning.
+ * The batch hook may return the original list or a list with selected
+ * candidates removed; ownership of the List cells remains with the caller.
+ */
 typedef bool (*path_cost_model_active_hook_type) (void);
-typedef void (*path_cost_model_batch_hook_type) (RelOptInfo *rel,
-												 List *paths,
-												 bool partial);
+typedef List *(*path_cost_model_batch_hook_type) (RelOptInfo *rel,
+											  List *paths,
+											  bool partial);
 extern PGDLLIMPORT path_cost_model_active_hook_type path_cost_model_active_hook;
 extern PGDLLIMPORT path_cost_model_batch_hook_type path_cost_model_batch_hook;
 
