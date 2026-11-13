@@ -103,6 +103,11 @@ typedef struct PlanReplayPruneEntry
 static int plan_replay_mode = PLAN_REPLAY_MODE_OFF;
 static int plan_replay_path_mode = PLAN_REPLAY_CHANNEL_INHERIT;
 static int plan_replay_cardinality_mode = PLAN_REPLAY_CHANNEL_INHERIT;
+/* Keep the capture-time planner pipeline even when no output is requested. */
+static bool plan_replay_force_path_processing = false;
+/* Explicit replay entries take precedence; the fallback is opt-in. */
+static bool plan_replay_penalize_unmatched_paths = false;
+#define PLAN_REPLAY_UNMATCHED_PATH_COST 1.0e100
 static char *plan_replay_path_capture_file = NULL;
 static char *plan_replay_path_replay_file = NULL;
 static char *plan_replay_path_prune_file = NULL;
@@ -128,9 +133,11 @@ static uint64 plan_replay_cardinality_sequence = 0;
 static uint64 plan_replay_cost_replay_entry_count = 0;
 static uint64 plan_replay_cost_replay_applied_count = 0;
 static uint64 plan_replay_cost_replay_matched_entry_count = 0;
+static uint64 plan_replay_cost_penalized_count = 0;
 static uint64 plan_replay_last_cost_replay_entry_count = 0;
 static uint64 plan_replay_last_cost_replay_applied_count = 0;
 static uint64 plan_replay_last_cost_replay_unmatched_count = 0;
+static uint64 plan_replay_last_cost_penalized_count = 0;
 static uint64 plan_replay_path_prune_entry_count = 0;
 static uint64 plan_replay_path_prune_applied_count = 0;
 static uint64 plan_replay_path_prune_matched_entry_count = 0;
@@ -650,17 +657,32 @@ plan_replay_append_descriptor_path_list(StringInfo output, const char *name,
 }
 
 static void
-plan_replay_append_descriptor_target_sortgrouprefs(StringInfo output,
-												PathTarget *target)
+plan_replay_append_descriptor_target(StringInfo output, PathTarget *target)
 {
 	int count = list_length(target->exprs);
-	int index;
+	char **values = palloc(sizeof(char *) * Max(1, count));
+	ListCell *cell;
+	int index = 0;
 
-	appendStringInfoString(output, "|target_sortgrouprefs=[");
+	/* Sort copies only: preserve expression/ref association and multiplicity. */
+	foreach(cell, target->exprs)
+	{
+		StringInfoData value;
+
+		initStringInfo(&value);
+		appendStringInfo(&value, "sortgroupref=%u",
+						 target->sortgrouprefs != NULL ? target->sortgrouprefs[index] : 0);
+		plan_replay_append_descriptor_node(&value, "expr", lfirst(cell));
+		values[index++] = value.data;
+	}
+	qsort(values, count, sizeof(char *), plan_replay_string_compare);
+	appendStringInfoString(output, "|target_exprs_unordered=[");
 	for (index = 0; index < count; index++)
-		appendStringInfo(output, "%u;",
-						 target->sortgrouprefs != NULL ?
-						 target->sortgrouprefs[index] : 0);
+	{
+		appendStringInfo(output, "%zu:%s;", strlen(values[index]), values[index]);
+		pfree(values[index]);
+	}
+	pfree(values);
 	appendStringInfoChar(output, ']');
 }
 
@@ -673,12 +695,12 @@ plan_replay_append_path_descriptor(StringInfo output, Path *path)
 	if (nodeTag(path) == T_Path && path->pathtype != T_SeqScan)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("Path type %s is not supported by stable Path ID format 2",
+				 errmsg("Path type %s is not supported by stable Path ID format 3",
 						plan_replay_path_node_name(path)),
 				 errdetail("Cost capture and replay fail closed instead of falling back to sequence matching.")));
 
 	appendStringInfo(output,
-				 "pg_plan_replay_path_id_v2|node_tag=%d|pathtype=%d"
+				 "pg_plan_replay_path_id_v3|node_tag=%d|pathtype=%d"
 				 "|parallel_aware=%d|parallel_safe=%d|parallel_workers=%d",
 				 (int) nodeTag(path), (int) path->pathtype,
 				 path->parallel_aware ? 1 : 0, path->parallel_safe ? 1 : 0,
@@ -696,12 +718,7 @@ plan_replay_append_path_descriptor(StringInfo output, Path *path)
 		plan_replay_append_descriptor_clause_set(output, "base_restrictions",
 											 path->parent->baserestrictinfo, true);
 	if (path->pathtarget != NULL)
-	{
-		plan_replay_append_descriptor_node(output, "target_exprs",
-									  path->pathtarget->exprs);
-		plan_replay_append_descriptor_target_sortgrouprefs(output,
-													 path->pathtarget);
-	}
+		plan_replay_append_descriptor_target(output, path->pathtarget);
 	else
 		appendStringInfoString(output, "|target=null");
 
@@ -899,7 +916,7 @@ plan_replay_append_path_descriptor(StringInfo output, Path *path)
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("Path type %s is not supported by stable Path ID format 2",
+					 errmsg("Path type %s is not supported by stable Path ID format 3",
 							plan_replay_path_node_name(path)),
 					 errdetail("Cost capture and replay fail closed instead of falling back to sequence matching.")));
 	}
@@ -1034,13 +1051,13 @@ plan_replay_load_costs(void)
 
 			if (newline != NULL)
 				*newline = '\0';
-			if (strcmp(cursor, "# pg_plan_replay_costs format=3") != 0 ||
+			if (strcmp(cursor, "# pg_plan_replay_costs format=4") != 0 ||
 				header_seen || line_number != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("invalid pg_plan_replay cost replay header at line "
 								UINT64_FORMAT, line_number),
-						 errdetail("Expected exactly: # pg_plan_replay_costs format=3"),
+						 errdetail("Expected exactly: # pg_plan_replay_costs format=4"),
 						 errhint("Path ID v2 requires new captures; recapture legacy Path replay files.")));
 			header_seen = true;
 			continue;
@@ -1120,7 +1137,7 @@ invalid_line:
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("pg_plan_replay cost replay file is empty"),
-				 errdetail("Expected header: # pg_plan_replay_costs format=3")));
+				 errdetail("Expected header: # pg_plan_replay_costs format=4")));
 }
 
 static bool
@@ -1134,7 +1151,16 @@ plan_replay_replay_path(Path *path)
 	id.lo = path->plan_replay_path_id_lo;
 	entry = hash_search(plan_replay_cost_table, &id, HASH_FIND, NULL);
 	if (entry == NULL)
+	{
+		if (plan_replay_penalize_unmatched_paths)
+		{
+			path->startup_cost = PLAN_REPLAY_UNMATCHED_PATH_COST;
+			path->total_cost = PLAN_REPLAY_UNMATCHED_PATH_COST;
+			plan_replay_cost_penalized_count++;
+		}
+		/* A fallback penalty is not a hit on an explicit replay entry. */
 		return false;
+	}
 
 	path->startup_cost = entry->startup_cost;
 	path->total_cost = entry->total_cost;
@@ -1181,13 +1207,13 @@ plan_replay_load_prunes(void)
 
 			if (newline != NULL)
 				*newline = '\0';
-			if (strcmp(cursor, "# pg_plan_replay_prune format=2") != 0 ||
+			if (strcmp(cursor, "# pg_plan_replay_prune format=3") != 0 ||
 				header_seen || line_number != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("invalid pg_plan_replay Path prune header at line "
 								UINT64_FORMAT, line_number),
-						 errdetail("Expected exactly: # pg_plan_replay_prune format=2"),
+						 errdetail("Expected exactly: # pg_plan_replay_prune format=3"),
 						 errhint("Path ID v2 requires new captures; recapture legacy Path replay files.")));
 			header_seen = true;
 			continue;
@@ -1242,7 +1268,7 @@ invalid_line:
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("pg_plan_replay Path prune file is empty"),
-				 errdetail("Expected header: # pg_plan_replay_prune format=2")));
+				 errdetail("Expected header: # pg_plan_replay_prune format=3")));
 }
 
 static bool
@@ -1460,7 +1486,8 @@ plan_replay_is_active(void)
 {
 	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
 
-	return plan_replay_path_capture_stream != NULL ||
+	return (plan_replay_statement_active && plan_replay_force_path_processing) ||
+		plan_replay_path_capture_stream != NULL ||
 		plan_replay_path_replay_stream != NULL ||
 		plan_replay_path_prune_stream != NULL ||
 		plan_replay_mode_predicts(path_mode) ||
@@ -1516,7 +1543,8 @@ plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 	bool *prune_applied;
 	int path_count = list_length(paths);
 	int path_mode = plan_replay_effective_channel_mode(plan_replay_path_mode);
-	bool path_channel_active = plan_replay_path_capture_stream != NULL ||
+	bool path_channel_active = plan_replay_force_path_processing ||
+		plan_replay_path_capture_stream != NULL ||
 		plan_replay_path_replay_stream != NULL ||
 		plan_replay_prune_table != NULL ||
 		plan_replay_mode_predicts(path_mode);
@@ -1691,7 +1719,7 @@ plan_replay_begin_statement(void)
 
 	plan_replay_statement_active = false;
 	if (!capture_paths && !replay_paths && !predict_paths && !prune_paths &&
-		!replay_cardinality)
+		!replay_cardinality && !plan_replay_force_path_processing)
 		return;
 	plan_replay_statement_active = true;
 
@@ -1747,6 +1775,7 @@ plan_replay_begin_statement(void)
 	plan_replay_cost_replay_entry_count = 0;
 	plan_replay_cost_replay_applied_count = 0;
 	plan_replay_cost_replay_matched_entry_count = 0;
+	plan_replay_cost_penalized_count = 0;
 	plan_replay_path_prune_entry_count = 0;
 	plan_replay_path_prune_applied_count = 0;
 	plan_replay_path_prune_matched_entry_count = 0;
@@ -1755,7 +1784,8 @@ plan_replay_begin_statement(void)
 	plan_replay_cardinality_replay_matched_entry_count = 0;
 	plan_replay_online_reset_stats(&plan_replay_current_online_stats);
 	plan_replay_planner_root = NULL;
-	if (capture_paths || replay_paths || predict_paths || prune_paths)
+	if (capture_paths || replay_paths || predict_paths || prune_paths ||
+		plan_replay_force_path_processing)
 		plan_replay_create_path_tables(replay_paths, prune_paths);
 	/* Compute logical IDs for EXPLAIN whenever either channel is active. */
 	plan_replay_cardinality_identity_begin(replay_cardinality);
@@ -1814,7 +1844,7 @@ plan_replay_begin_statement(void)
 					 errmsg("could not open pg_plan_replay Path capture file \"%s\": %m",
 							plan_replay_path_capture_file)));
 		fprintf(plan_replay_path_capture_stream,
-				"{\"record\":\"header\",\"format_version\":9,\"path_id_version\":2,"
+				"{\"record\":\"header\",\"format_version\":9,\"path_id_version\":3,"
 				"\"parallel_leader_participation\":%s}\n",
 				parallel_leader_participation ? "true" : "false");
 	}
@@ -1916,6 +1946,7 @@ plan_replay_finish_statement(void)
 	plan_replay_last_cost_replay_applied_count =
 		plan_replay_cost_replay_applied_count;
 	plan_replay_last_cost_replay_unmatched_count = unmatched_costs;
+	plan_replay_last_cost_penalized_count = plan_replay_cost_penalized_count;
 	plan_replay_last_path_prune_entry_count =
 		plan_replay_path_prune_entry_count;
 	plan_replay_last_path_prune_applied_count =
@@ -1930,7 +1961,7 @@ plan_replay_finish_statement(void)
 	plan_replay_last_online_stats = plan_replay_current_online_stats;
 	if (plan_replay_path_capture_stream != NULL)
 	{
-		char stats[1024];
+		char stats[2048];
 
 		plan_replay_format_stats(stats, sizeof(stats));
 		fprintf(plan_replay_path_capture_stream,
@@ -2026,7 +2057,7 @@ static void
 plan_replay_format_stats(char *json, size_t size)
 {
 	snprintf(json, size,
-			 "{\"path_id_version\":2,\"path_capture_version\":9,\"rows_format\":2,\"cost_format\":3,\"prune_format\":2,\"planning_ms\":%.6f,\"execution_ms\":0,\"inference_ms\":%.6f,"
+			 "{\"path_id_version\":3,\"path_capture_version\":9,\"rows_format\":2,\"cost_format\":4,\"prune_format\":3,\"plan_row_scope_version\":1,\"planning_ms\":%.6f,\"execution_ms\":0,\"inference_ms\":%.6f,"
 			 "\"batches\":" UINT64_FORMAT ",\"paths\":" UINT64_FORMAT
 			 ",\"model_batches\":" UINT64_FORMAT
 			 ",\"model_paths\":" UINT64_FORMAT
@@ -2034,6 +2065,7 @@ plan_replay_format_stats(char *json, size_t size)
 			 ",\"cost_replay_entries\":" UINT64_FORMAT
 			 ",\"cost_replay_applied\":" UINT64_FORMAT
 			 ",\"cost_replay_unmatched\":" UINT64_FORMAT
+			 ",\"cost_penalized_paths\":" UINT64_FORMAT
 			 ",\"path_prune_entries\":" UINT64_FORMAT
 			 ",\"path_prune_applied\":" UINT64_FORMAT
 			 ",\"path_prune_unmatched\":" UINT64_FORMAT
@@ -2050,6 +2082,7 @@ plan_replay_format_stats(char *json, size_t size)
 			 plan_replay_last_cost_replay_entry_count,
 			 plan_replay_last_cost_replay_applied_count,
 			 plan_replay_last_cost_replay_unmatched_count,
+			 plan_replay_last_cost_penalized_count,
 			 plan_replay_last_path_prune_entry_count,
 			 plan_replay_last_path_prune_applied_count,
 			 plan_replay_last_path_prune_unmatched_count,
@@ -2061,7 +2094,7 @@ plan_replay_format_stats(char *json, size_t size)
 Datum
 plan_replay_last_timing(PG_FUNCTION_ARGS)
 {
-	char json[1024];
+	char json[2048];
 
 	plan_replay_format_stats(json, sizeof(json));
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json)));
@@ -2079,9 +2112,11 @@ plan_replay_reset_stats(PG_FUNCTION_ARGS)
 	plan_replay_cost_replay_entry_count = 0;
 	plan_replay_cost_replay_applied_count = 0;
 	plan_replay_cost_replay_matched_entry_count = 0;
+	plan_replay_cost_penalized_count = 0;
 	plan_replay_last_cost_replay_entry_count = 0;
 	plan_replay_last_cost_replay_applied_count = 0;
 	plan_replay_last_cost_replay_unmatched_count = 0;
+	plan_replay_last_cost_penalized_count = 0;
 	plan_replay_path_prune_entry_count = 0;
 	plan_replay_path_prune_applied_count = 0;
 	plan_replay_path_prune_matched_entry_count = 0;
@@ -2127,6 +2162,22 @@ _PG_init(void)
 						 &plan_replay_cardinality_mode,
 						 PLAN_REPLAY_CHANNEL_INHERIT,
 						 plan_replay_cardinality_mode_options,
+						 PGC_SUSET,
+						 0,
+						 NULL, NULL, NULL);
+	DefineCustomBoolVariable("plan_replay.force_path_processing",
+						 "Use capture-style Path processing even with the Path channel off.",
+						 "Bypass cost prechecks and keep relation-local batching and Path identity processing; does not write capture files or enable interventions.",
+						 &plan_replay_force_path_processing,
+						 false,
+						 PGC_SUSET,
+						 0,
+						 NULL, NULL, NULL);
+	DefineCustomBoolVariable("plan_replay.penalize_unmatched_paths",
+						 "Assign a high cost to Paths without an explicit cost replay entry.",
+						 "Only active during cost replay; unmatched candidates receive startup and total cost 1e100 before native pruning. Explicit replay hit statistics are unchanged.",
+						 &plan_replay_penalize_unmatched_paths,
+						 false,
 						 PGC_SUSET,
 						 0,
 						 NULL, NULL, NULL);

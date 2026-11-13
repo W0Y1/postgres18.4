@@ -3,8 +3,7 @@
 ## RCA 精简捕获
 
 RCA 使用 Path capture v9；不再生成或读取 `cardinality.jsonl`。`observation.c`、
-`plan_replay.observe`、两个 EXPLAIN 回调及 watch GUC 已移除；本次变更没有
-增加或修改 PostgreSQL 内核接口。
+`plan_replay.observe`、两个 EXPLAIN 回调及 watch GUC 已移除。
 
 - `paths.jsonl` 只记录候选 `path_id`、`parallel_workers` 和必要的
   `partial` / 代价注入 / 剪枝命中标志。leader 配置在每段文件头保存一次。
@@ -16,10 +15,72 @@ RCA 使用 Path capture v9；不再生成或读取 `cardinality.jsonl`。`observ
   不进入 LLM 输入。节点行数除数由 Agent 按同次规划的并行信息计算。
 
 Path 通道无干预时使用 `capture`；代价注入时使用 `capture_replay`，剪枝时使用
-`capture_prune`。基数通道无干预时使用 `off`，注入时使用 `replay`。原有 `.rows` format=2、`.costs` format=3、
-`.prunes` format=2 输入协议和稳定 ID 算法保持不变。
+`capture_prune`。基数通道无干预时使用 `off`，注入时使用 `replay`。当前 `.rows` format=2、`.costs` format=4、
+`.prunes` format=3；Path ID 已更新为 v3，旧 ID 必须重新采集，不能仅修改文件头。
+
+## 强保护与输出列身份
+
+`plan_replay.penalize_unmatched_paths` 是默认关闭的布尔 GUC。仅在 Path cost replay
+生效、有代价输入表时起作用：匹配的候选按文件数值注入；未匹配的候选统一将
+startup/total cost 设为有限值 `1e100`。处理位于候选批次的原生裁剪之前，因此也覆盖
+本轮新生成、此前 capture 未出现的候选。关闭开关时，未匹配候选维持原生代价。
+它不改变 disabled_nodes、参数化、pathkeys 或并行合法性，也不保证 GEQO 枚举某个连接顺序。
+
+该回退不设置 `cost_replay_applied`，不影响显式文件的 entries/applied/unmatched
+统计；`cost_penalized_paths` 单独统计抬价候选次数（包括不同 GEQO 轮次的重复候选）。
+搜索空间保护可给目标写 `(0, 0)` 并开启此 GUC，其他实验应显式关闭。
+
+Path ID v3 将输出表达式与对应 sortgroupref 组成条目，排序后计算身份。只改变
+描述符中的排列，保留重复条目，不修改 PathTarget、实际计划或 SQL 的输出顺序。
+其他有顺序语义的属性，例如 pathkeys、连接内外侧及 Append 子路径顺序，继续保留。
+新版本使用 cost format=4、prune format=3；旧捕获和输入文件不能直接回放到新版本，
+需要新 attempt 重采集，历史报告和原始文件不重写。
+
+```sql
+LOAD 'pg_plan_replay';
+SET LOCAL plan_replay.path_mode = 'capture_replay';
+SET LOCAL plan_replay.path_capture_file = '/absolute/path/protection.paths.jsonl';
+SET LOCAL plan_replay.path_replay_file = '/absolute/path/targets.costs';
+SET LOCAL plan_replay.penalize_unmatched_paths = on;
+-- 在事务中执行普通 EXPLAIN；targets.costs 使用 format=4，只列显式目标。
+```
 
 ## 捕获与回放模式
+
+无捕获的行数口径不依赖 Gather 或实际 `Workers` 数组。最终 Path 转为 Plan 时，
+直接保存该 Path 自身的 `parallel_workers` 和规划时的 leader 参与配置。EXPLAIN
+在可用节点输出 `Plan Replay Parallel Workers`、`Plan Replay Leader Participation`
+及 `Plan Replay Row Scope Source=selected_path`。Agent 根据这些字段计算 D；
+仅这些最终计划诊断字段常驻 Plan，不重新捕获候选或改变 precheck。Path workers
+可能与 Gather 的 Workers Planned 不同；例如 Gather=2、内侧 Path=1 时 D=1.7。
+
+`plan_replay_last_timing()` 的 `plan_row_scope_version=1` 声明此能力。更新包含 Plan
+结构变化，必须完整重编译 PostgreSQL，并重编译安装 pg_plan_replay、pg_hint_plan
+等依赖 Plan 布局的扩展；不能只替换旧服务器上的动态库。数据目录保持原样。
+
+`plan_replay.force_path_processing`（布尔值，默认 `off`）可以在不写捕获文件时
+保持原有捕获使用的优化器流程。设为 `on` 后，即使 `path_mode=off`，也会放行
+`add_path_precheck` / `add_partial_path_precheck`，暂存候选并在原有位置批处理，
+计算 Path 身份及诊断计数，然后进行原生剪枝；不会自行启用代价注入、预测或指定
+Path 剪枝。原有 capture/replay/predict/prune 模式的行为保持不变。
+
+RCA 在 baseline、探索和搜索空间保护实验中开启此开关；正式基数实验、withdrawal
+和最终执行则关闭此开关，并同时关闭 Path 捕获，恢复原生 precheck 与即时竞争。
+需要捕获时仍使用 `path_mode=capture` 等模式；只注入基数、不写 `paths.jsonl` 时
+使用 `path_mode=off`、`cardinality_mode=replay`。该 GUC 可用于单独控制捕获流程，但正式基数阶段不使用强制放行：
+候选必须在原生搜索流程中真实产生并执行。baseline／探索保留的捕获流程不能称为
+完全未经改动的原生搜索流程；规划 CPU、内存及文件 I/O 开销也不能视为相等。
+
+```sql
+LOAD 'pg_plan_replay';
+SET plan_replay.force_path_processing = on;
+SET plan_replay.path_mode = off;
+SET plan_replay.cardinality_mode = off;
+EXPLAIN (VERBOSE, FORMAT JSON) SELECT * FROM pg_catalog.pg_class;
+-- 读取统计前关闭，避免统计 SELECT 自身重置上一条语句的计数。
+SET plan_replay.force_path_processing = off;
+SELECT plan_replay_last_timing();
+```
 
 离线采集和回放不需要推理服务。在线 Path 代价预测通过独立 Python 服务完成。
 `plan_replay.mode` 保留为同时控制两个离线通道的兼容入口；需要独立实验、迭代采集
@@ -281,7 +342,7 @@ SET plan_replay.mode = 'off';
 Path v9 的文件头及普通候选记录示例：
 
 ```jsonl
-{"record":"header","format_version":9,"path_id_version":2,"parallel_leader_participation":true}
+{"record":"header","format_version":9,"path_id_version":3,"parallel_leader_participation":true}
 {"path_id":"7ddc6720f8e6eec1354813d528c9d1f3","parallel_workers":0}
 ```
 
@@ -304,9 +365,9 @@ EXPLAIN 继续输出最终计划的 `Plan Replay Path ID` 和 `Plan Replay Cardi
 否则 leader 不参与时为 workers，参与时为 workers + max(0, 1−0.3×workers)。
 Agent 使用 Actual Rows × D，不乘 loops；不能把 D 当作实际进程数或精确总行数。
 
-Path ID v2 使用明确的 PathKey/EC 语义序列化：表达式、成员类型、运算族、collation、方向、NULL 顺序；不序列化整个 EC 的派生条件与估价缓存。保留参数化条件、索引、连接条件及子 Path 身份。ID 描述符在语句上下文中分配，GEQO 释放临时 tour 上下文后仍有效。
+Path ID v3 沿用明确的 PathKey/EC 语义序列化：表达式、成员类型、运算族、collation、方向、NULL 顺序；不序列化整个 EC 的派生条件与估价缓存。保留参数化条件、索引、连接条件及子 Path 身份。ID 描述符在语句上下文中分配，GEQO 释放临时 tour 上下文后仍有效。
 
-`.costs` format 3、`.prunes` format 2 与 ID v2 配套，旧版本明确拒绝，必须重新采集；基数协议不变。`plan_replay_last_timing()` 同时公布 ID、Path capture、cost、prune 和 rows 版本（`rows_format=2`），供 Agent 能力检查。历史文件不自动升级或覆盖。
+`.costs` format 4、`.prunes` format 3 与 ID v3 配套，旧版本明确拒绝，必须重新采集；基数协议不变。`plan_replay_last_timing()` 同时公布 ID、Path capture、cost、prune 和 rows 版本（`rows_format=2`），供 Agent 能力检查。历史文件不自动升级或覆盖。
 
 ID 使用 SHA-256 的前 128 位。描述符明确排除 cost、rows、selectivity、真实执行
 时间、sequence、列表位置和内存地址。Join 的 outer/inner 子 Path 顺序保留，
@@ -366,10 +427,10 @@ python3 tools/jsonl_to_replay.py test/query.paths.jsonl
 
 ## 统一回放
 
-代价回放使用 format 3 稀疏文件，只保存具有真实代价的最终计划节点：
+代价回放使用 format 4 稀疏文件，只保存具有真实代价的最终计划节点：
 
 ```text
-# pg_plan_replay_costs format=3
+# pg_plan_replay_costs format=4
 7ddc6720f8e6eec1354813d528c9d1f3 0.006 0.193
 a1c23e5c2c978813f737dac41d99cd19 0.244 0.303
 ```
@@ -409,7 +470,7 @@ Gather/Gather Merge。遇到其他 Path 类型会 fail closed 并报告不支持
 是稀疏的稳定物理 Path ID 集合：
 
 ```text
-# pg_plan_replay_prune format=2
+# pg_plan_replay_prune format=3
 2430f875713b39682743c9a3516729ed
 ```
 

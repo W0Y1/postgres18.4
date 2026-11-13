@@ -5533,6 +5533,12 @@ copy_generic_path_info(Plan *dest, Path *src)
 		src->plan_replay_cardinality_id_valid;
 	dest->plan_replay_cardinality_id_hi = src->plan_replay_cardinality_id_hi;
 	dest->plan_replay_cardinality_id_lo = src->plan_replay_cardinality_id_lo;
+	/* Preserve diagnostics only after Path selection, without affecting search. */
+	dest->plan_replay_row_scope_valid =
+		(src->plan_replay_cardinality_id_valid ||
+		 src->plan_replay_path_sequence_valid) && src->parallel_workers >= 0;
+	dest->plan_replay_parallel_workers = src->parallel_workers;
+	dest->plan_replay_leader_participation = parallel_leader_participation;
 }
 
 /*

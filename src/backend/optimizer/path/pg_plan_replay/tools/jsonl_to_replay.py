@@ -15,7 +15,7 @@ class ConversionError(ValueError):
 
 
 PATH_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
-COSTS_HEADER = "# pg_plan_replay_costs format=3\n"
+COSTS_HEADER = "# pg_plan_replay_costs format=4\n"
 CARDINALITIES_HEADER = "# pg_plan_replay_cardinalities format=2\n"
 
 
@@ -125,7 +125,7 @@ def validate_compact_capture(path, kind):
             if header is None:
                 if row.get("record") != "header" or row.get("format_version") != version:
                     raise ConversionError(f"capture v{version} required; recapture legacy files")
-                if kind == "path" and (row.get("path_id_version") != 2 or
+                if kind == "path" and (row.get("path_id_version") != 3 or
                         type(row.get("parallel_leader_participation")) is not bool):
                     raise ConversionError("invalid Path identity or parallel header")
                 header, count = row, 0
@@ -163,8 +163,8 @@ def convert_costs(path):
 
     for expected, (line_number, record) in enumerate(load_jsonl(path)):
         validate_sequence(path, line_number, record, expected)
-        if record.get("format_version") != 8 or record.get("path_id_version") != 2:
-            raise ConversionError("Path ID v2 / capture v8 required; recapture legacy files")
+        if record.get("format_version") != 8 or record.get("path_id_version") != 3:
+            raise ConversionError("Path ID v3 required; recapture legacy files")
         path_id = record.get("path_id")
         if not isinstance(path_id, str) or not PATH_ID_PATTERN.fullmatch(path_id):
             raise ConversionError(

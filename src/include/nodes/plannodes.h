@@ -210,6 +210,10 @@ typedef struct Plan
 	bool		plan_replay_cardinality_id_valid;
 	uint64		plan_replay_cardinality_id_hi;
 	uint64		plan_replay_cardinality_id_lo;
+	/* Selected Path's own planning scope, independent of Path capture. */
+	bool		plan_replay_row_scope_valid;
+	int			plan_replay_parallel_workers;
+	bool		plan_replay_leader_participation;
 	/* target list to be computed at this node */
 	List	   *targetlist;
 	/* implicitly-ANDed qual conditions */

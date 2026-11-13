@@ -638,6 +638,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 * depending on build options.  Might want to separate that out from COSTS
 	 * at a later stage.
 	 */
+
 	if (es->costs)
 		ExplainPrintJITSummary(es, queryDesc);
 
@@ -1836,6 +1837,23 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							 cardinality_id);
 		else
 			ExplainPropertyText("Plan Replay Cardinality ID", cardinality_id, es);
+	}
+
+	if (plan->plan_replay_row_scope_valid)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str,
+							 " (plan_replay_parallel_workers=%d plan_replay_leader_participation=%s)",
+							 plan->plan_replay_parallel_workers,
+							 plan->plan_replay_leader_participation ? "true" : "false");
+		else
+		{
+			ExplainPropertyInteger("Plan Replay Parallel Workers", NULL,
+								   plan->plan_replay_parallel_workers, es);
+			ExplainPropertyBool("Plan Replay Leader Participation",
+								plan->plan_replay_leader_participation, es);
+			ExplainPropertyText("Plan Replay Row Scope Source", "selected_path", es);
+		}
 	}
 
 	if (es->costs)
