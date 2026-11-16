@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
@@ -1860,7 +1862,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	{
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
-			appendStringInfo(es->str, "  (cost=%.2f..%.2f rows=%.0f width=%d)",
+			appendStringInfo(es->str,
+						 plan->plan_rows != rint(plan->plan_rows) ?
+						 "  (cost=%.2f..%.2f rows=%.17g width=%d)" :
+						 "  (cost=%.2f..%.2f rows=%.0f width=%d)",
 							 plan->startup_cost, plan->total_cost,
 							 plan->plan_rows, plan->plan_width);
 		}
@@ -1871,7 +1876,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainPropertyFloat("Total Cost", NULL, plan->total_cost,
 								 2, es);
 			ExplainPropertyFloat("Plan Rows", NULL, plan->plan_rows,
-								 0, es);
+								 plan->plan_rows != rint(plan->plan_rows) ? -1 : 0, es);
 			ExplainPropertyInteger("Plan Width", NULL, plan->plan_width,
 								   es);
 		}

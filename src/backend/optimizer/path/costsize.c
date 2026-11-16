@@ -165,6 +165,7 @@ bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
 cardinality_estimate_hook_type cardinality_estimate_hook = NULL;
+index_cardinality_hook_type index_cardinality_hook = NULL;
 
 typedef struct
 {
@@ -232,6 +233,26 @@ clamp_row_est(double nrows)
 		nrows = rint(nrows);
 
 	return nrows;
+}
+
+/* Preserve explicit positive fractional observations, not native estimates.
+ * Zero retains PostgreSQL's existing one-row safety floor. */
+double
+clamp_replayed_row_est(double rows, bool preserve_fractional_rows)
+{
+	if (preserve_fractional_rows && isfinite(rows) && rows > 0.0 &&
+		rows <= MAXIMUM_ROWCOUNT)
+		return rows;
+	return clamp_row_est(rows);
+}
+
+/* The estimate belongs to the parameterization when one is present. */
+static bool
+path_preserves_fractional_rows(Path *path)
+{
+	return path->param_info ?
+		path->param_info->plan_replay_preserve_fractional_rows :
+		path->parent->plan_replay_preserve_fractional_rows;
 }
 
 /*
@@ -357,7 +378,8 @@ cost_seqscan(Path *path, PlannerInfo *root,
 		 * In the case of a parallel plan, the row count needs to represent
 		 * the number of tuples processed per worker.
 		 */
-		path->rows = clamp_row_est(path->rows / parallel_divisor);
+		path->rows = clamp_replayed_row_est(path->rows / parallel_divisor,
+									 path_preserves_fractional_rows(path));
 	}
 
 	path->disabled_nodes = enable_seqscan ? 0 : 1;
@@ -636,6 +658,9 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 				   &indexSelectivity, &indexCorrelation,
 				   &index_pages);
 
+	if (index_cardinality_hook)
+		indexSelectivity = index_cardinality_hook(root, path, indexSelectivity);
+
 	/*
 	 * Save amcostestimate's results for possible use in bitmap scan planning.
 	 * We don't bother to save indexStartupCost or indexCorrelation, because a
@@ -824,7 +849,8 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	{
 		double		parallel_divisor = get_parallel_divisor(&path->path);
 
-		path->path.rows = clamp_row_est(path->path.rows / parallel_divisor);
+		path->path.rows = clamp_replayed_row_est(path->path.rows / parallel_divisor,
+										  path_preserves_fractional_rows(&path->path));
 
 		/* The CPU cost is divided among all the workers. */
 		cpu_run_cost /= parallel_divisor;
@@ -1105,7 +1131,8 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 		/* The CPU cost is divided among all the workers. */
 		cpu_run_cost /= parallel_divisor;
 
-		path->rows = clamp_row_est(path->rows / parallel_divisor);
+		path->rows = clamp_replayed_row_est(path->rows / parallel_divisor,
+									 path_preserves_fractional_rows(path));
 	}
 
 
@@ -3386,7 +3413,8 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
 		path->jpath.path.rows =
-			clamp_row_est(path->jpath.path.rows / parallel_divisor);
+			clamp_replayed_row_est(path->jpath.path.rows / parallel_divisor,
+								   path_preserves_fractional_rows(&path->jpath.path));
 	}
 
 	/* cost of inner-relation source data (we already dealt with outer rel) */
@@ -3884,7 +3912,8 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
 		path->jpath.path.rows =
-			clamp_row_est(path->jpath.path.rows / parallel_divisor);
+			clamp_replayed_row_est(path->jpath.path.rows / parallel_divisor,
+								   path_preserves_fractional_rows(&path->jpath.path));
 	}
 
 	/*
@@ -4316,7 +4345,8 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
 		path->jpath.path.rows =
-			clamp_row_est(path->jpath.path.rows / parallel_divisor);
+			clamp_replayed_row_est(path->jpath.path.rows / parallel_divisor,
+								   path_preserves_fractional_rows(&path->jpath.path));
 	}
 
 	/* mark the path with estimated # of batches */
@@ -5382,12 +5412,14 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 		context.rel = rel;
 		context.restrictlist = rel->baserestrictinfo;
 		context.native_rows = rel->rows;
-		rel->rows = clamp_row_est(cardinality_estimate_hook(root, &context));
+		rel->rows = cardinality_estimate_hook(root, &context);
+		rel->rows = clamp_replayed_row_est(rel->rows, context.preserve_fractional_rows);
 		rel->plan_replay_cardinality_sequence_valid = context.sequence_valid;
 		rel->plan_replay_cardinality_sequence = context.sequence;
 		rel->plan_replay_cardinality_id_valid = context.cardinality_id_valid;
 		rel->plan_replay_cardinality_id_hi = context.cardinality_id_hi;
 		rel->plan_replay_cardinality_id_lo = context.cardinality_id_lo;
+		rel->plan_replay_preserve_fractional_rows = context.preserve_fractional_rows;
 	}
 }
 
@@ -5433,7 +5465,10 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 	context->required_outer = required_outer;
 	context->native_rows = nrows;
 	if (cardinality_estimate_hook != NULL)
-		nrows = clamp_row_est(cardinality_estimate_hook(root, context));
+	{
+		nrows = cardinality_estimate_hook(root, context);
+		nrows = clamp_replayed_row_est(nrows, context->preserve_fractional_rows);
+	}
 	if (nrows > rel->rows)
 		nrows = rel->rows;
 	return nrows;
@@ -5485,6 +5520,7 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 	rel->plan_replay_cardinality_id_valid = context.cardinality_id_valid;
 	rel->plan_replay_cardinality_id_hi = context.cardinality_id_hi;
 	rel->plan_replay_cardinality_id_lo = context.cardinality_id_lo;
+	rel->plan_replay_preserve_fractional_rows = context.preserve_fractional_rows;
 }
 
 /*
@@ -5701,7 +5737,7 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 	if (cardinality_estimate_hook != NULL)
 		nrows = cardinality_estimate_hook(root, context);
 
-	return clamp_row_est(nrows);
+	return clamp_replayed_row_est(nrows, context->preserve_fractional_rows);
 }
 
 /*
@@ -6698,5 +6734,6 @@ compute_gather_rows(Path *path)
 {
 	Assert(path->parallel_workers > 0);
 
-	return clamp_row_est(path->rows * get_parallel_divisor(path));
+	return clamp_replayed_row_est(path->rows * get_parallel_divisor(path),
+								  path_preserves_fractional_rows(path));
 }

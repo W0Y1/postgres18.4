@@ -30,6 +30,7 @@
 
 #include "online_prediction.h"
 #include "cardinality_identity.h"
+#include "path_binding.h"
 
 PG_MODULE_MAGIC;
 
@@ -936,6 +937,11 @@ plan_replay_compute_path_id(Path *path)
 	}
 	initStringInfo(&descriptor);
 	plan_replay_append_path_descriptor(&descriptor, path);
+	/* The PPI is shared by equivalent logical populations; only the actual
+	 * candidate knows which physical outer implementation will drive it. */
+	if (path->plan_replay_physical_driver != NULL)
+		plan_replay_append_descriptor_child(&descriptor, "physical_driver",
+										   path->plan_replay_physical_driver);
 	id = plan_replay_hash_descriptor(descriptor.data);
 	plan_replay_register_descriptor(id, descriptor.data);
 	path->plan_replay_path_id_valid = true;
@@ -1435,7 +1441,7 @@ plan_replay_load_cardinalities(void)
 
 static Cardinality
 plan_replay_replay_cardinality(PlanReplayCardinalityId id,
-							   Cardinality native_rows)
+							   Cardinality native_rows, bool *preserve_fractional_rows)
 {
 	PlanReplayCardinalityEntry *entry;
 
@@ -1449,6 +1455,8 @@ plan_replay_replay_cardinality(PlanReplayCardinalityId id,
 		plan_replay_cardinality_replay_matched_entry_count++;
 	}
 	plan_replay_cardinality_replay_applied_count++;
+	*preserve_fractional_rows = entry->rows > 0.0 &&
+		entry->rows != rint(entry->rows);
 	return entry->rows;
 }
 
@@ -1471,8 +1479,15 @@ plan_replay_cardinality_estimate(PlannerInfo *root,
 	context->cardinality_id_valid = true;
 	context->cardinality_id_hi = id.hi;
 	context->cardinality_id_lo = id.lo;
-	if (plan_replay_cardinality_table != NULL)
-		rows = plan_replay_replay_cardinality(id, rows);
+	/* A reusable parameterized base template has no concrete input population.
+	 * Replay it only after binding to a Nested Loop's actual outer subtree. */
+	if (plan_replay_cardinality_table != NULL &&
+		((context->kind != CARDINALITY_ESTIMATE_PARAMETERIZED_BASE &&
+		  !(context->kind == CARDINALITY_ESTIMATE_INDEX_MATCH &&
+			!bms_is_empty(context->required_outer))) ||
+		 context->driving_path != NULL))
+		rows = plan_replay_replay_cardinality(id, rows,
+									 &context->preserve_fractional_rows);
 
 	/* sequence 仅在 ID 匹配完成后写回，确保它不可能影响身份。 */
 	context->sequence_valid = true;
@@ -1494,7 +1509,7 @@ plan_replay_is_active(void)
 		plan_replay_mode_prunes(path_mode);
 }
 
-static void
+void
 plan_replay_propagate_path_cardinality(Path *path)
 {
 	/*
@@ -1535,6 +1550,21 @@ plan_replay_propagate_path_cardinality(Path *path)
 	}
 }
 
+/* Do not intervene on reusable parameterized templates. A template can be
+ * visited/captured, but replay, unmatched penalties and pruning must wait
+ * until bind_parameterized_scan_context() knows its actual physical driver. */
+static bool
+plan_replay_unbound_scan_template(Path *path)
+{
+	if (path->plan_replay_physical_driver != NULL || path->param_info == NULL ||
+		path->parent == NULL || !IS_SIMPLE_REL(path->parent))
+		return false;
+	if (IsA(path, MemoizePath) || IsA(path, MaterialPath))
+		return true;
+	return IsA(path, IndexPath) || IsA(path, BitmapHeapPath) ||
+		(IsA(path, Path) && path->pathtype == T_SeqScan);
+}
+
 static List *
 plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 {
@@ -1573,17 +1603,30 @@ plan_replay_process_paths(RelOptInfo *rel, List *paths, bool partial)
 			path->plan_replay_path_id_lo = id.lo;
 		}
 		plan_replay_propagate_path_cardinality(path);
-		if (plan_replay_cost_table != NULL)
+		if (plan_replay_cost_table != NULL && !plan_replay_unbound_scan_template(path))
 			replay_applied[index] = plan_replay_replay_path(path);
-		if (plan_replay_prune_table != NULL)
+		if (plan_replay_prune_table != NULL && !plan_replay_unbound_scan_template(path))
 			prune_applied[index] = plan_replay_prune_path(path);
 		index++;
 	}
 
 	if (plan_replay_mode_predicts(path_mode))
-		(void) plan_replay_online_predict_paths(plan_replay_planner_root,
-												  rel, paths, partial,
-												  &plan_replay_current_online_stats);
+	{
+		List *ready = NIL;
+
+		foreach(cell, paths)
+		{
+			Path *path = lfirst(cell);
+
+			if (!plan_replay_unbound_scan_template(path))
+				ready = lappend(ready, path);
+		}
+		if (ready != NIL)
+			(void) plan_replay_online_predict_paths(plan_replay_planner_root,
+													  rel, ready, partial,
+													  &plan_replay_current_online_stats);
+		list_free(ready);
+	}
 
 	index = 0;
 	foreach(cell, paths)
@@ -1703,6 +1746,7 @@ plan_replay_destroy_path_tables(void)
 		plan_replay_cardinality_table = NULL;
 	}
 	plan_replay_cardinality_identity_end();
+	plan_replay_binding_end();
 }
 
 static void
@@ -1789,6 +1833,7 @@ plan_replay_begin_statement(void)
 		plan_replay_create_path_tables(replay_paths, prune_paths);
 	/* Compute logical IDs for EXPLAIN whenever either channel is active. */
 	plan_replay_cardinality_identity_begin(replay_cardinality);
+	plan_replay_binding_begin();
 	if (replay_cardinality)
 	{
 		HASHCTL control;
@@ -2226,11 +2271,13 @@ _PG_init(void)
 	path_cost_model_batch_hook = plan_replay_process_paths;
 	previous_cardinality_estimate_hook = cardinality_estimate_hook;
 	cardinality_estimate_hook = plan_replay_cardinality_estimate;
+	plan_replay_binding_init();
 }
 
 void
 _PG_fini(void)
 {
+	plan_replay_binding_fini();
 
 	if (set_rel_pathlist_hook == plan_replay_set_rel_pathlist)
 		set_rel_pathlist_hook = previous_set_rel_pathlist_hook;

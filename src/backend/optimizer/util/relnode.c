@@ -1622,6 +1622,8 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
+	ppi->plan_replay_preserve_fractional_rows =
+		cardinality_context.preserve_fractional_rows;
 	/*
 	 * 参数化基表的 ID 不能写入共享 RelOptInfo，否则会覆盖普通基表或另一组
 	 * required_outer 的身份；它和行数一起归属于当前 ParamPathInfo。
@@ -1853,6 +1855,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
+	ppi->plan_replay_preserve_fractional_rows =
+		cardinality_context.preserve_fractional_rows;
 	/* 参数化 Join 同理按 required_outer 缓存在自己的 ParamPathInfo 中。 */
 	ppi->plan_replay_cardinality_sequence_valid =
 		cardinality_context.sequence_valid;

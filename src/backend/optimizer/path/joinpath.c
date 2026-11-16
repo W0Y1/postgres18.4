@@ -915,6 +915,12 @@ try_nestloop_path(PlannerInfo *root,
 	 * The latter two steps are expensive enough to make this two-phase
 	 * methodology worthwhile.
 	 */
+	inner_path = bind_parameterized_scan_context(root, inner_path, outer_path);
+	if (inner_path == NULL)
+	{
+		bms_free(required_outer);
+		return;
+	}
 	initial_cost_nestloop(root, &workspace, jointype,
 						  outer_path, inner_path, extra);
 
@@ -1000,6 +1006,9 @@ try_partial_nestloop_path(PlannerInfo *root,
 	 * Before creating a path, get a quick lower bound on what it is likely to
 	 * cost.  Bail out right away if it looks terrible.
 	 */
+	inner_path = bind_parameterized_scan_context(root, inner_path, outer_path);
+	if (inner_path == NULL)
+		return;
 	initial_cost_nestloop(root, &workspace, jointype,
 						  outer_path, inner_path, extra);
 	if (!add_partial_path_precheck(joinrel, workspace.disabled_nodes,

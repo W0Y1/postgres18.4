@@ -45,7 +45,9 @@ typedef enum CardinalityEstimateKind
 	CARDINALITY_ESTIMATE_BASE,
 	CARDINALITY_ESTIMATE_PARAMETERIZED_BASE,
 	CARDINALITY_ESTIMATE_JOIN,
-	CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN
+	CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN,
+	/* Index quals and partial predicate, before heap recheck/qpquals. */
+	CARDINALITY_ESTIMATE_INDEX_MATCH
 } CardinalityEstimateKind;
 
 typedef struct CardinalityEstimateContext
@@ -63,6 +65,10 @@ typedef struct CardinalityEstimateContext
 	Cardinality outer_rows;
 	Cardinality inner_rows;
 	Cardinality native_rows;
+	/* Concrete producer of parameters; NULL while building reusable templates. */
+	Path	   *driving_path;
+	/* Set only by an explicitly matched positive fractional row replay. */
+	bool preserve_fractional_rows;
 
 	/*
 	 * hook 可填写的输出元数据。sequence 只定位本轮 JSONL 调用，不参与回放
@@ -79,6 +85,10 @@ typedef Cardinality (*cardinality_estimate_hook_type) (PlannerInfo *root,
 														CardinalityEstimateContext *context);
 
 extern PGDLLIMPORT cardinality_estimate_hook_type cardinality_estimate_hook;
+typedef Selectivity (*index_cardinality_hook_type) (PlannerInfo *root,
+												  IndexPath *path, Selectivity native_selectivity);
+extern PGDLLIMPORT index_cardinality_hook_type index_cardinality_hook;
+extern double clamp_replayed_row_est(double rows, bool preserve_fractional_rows);
 
 
 /*

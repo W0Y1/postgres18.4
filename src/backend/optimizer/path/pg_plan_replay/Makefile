@@ -4,6 +4,7 @@ ifeq ($(PG_PLAN_REPLAY_BUILD),1)
 
 MODULE_big = pg_plan_replay
 OBJS = src/pg_plan_replay.o \
+	src/path_binding.o \
 	   src/cardinality_identity.o \
 	   src/online_prediction.o \
 	   src/model_client.o

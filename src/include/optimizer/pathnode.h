@@ -29,6 +29,9 @@ typedef List *(*path_cost_model_batch_hook_type) (RelOptInfo *rel,
 											  bool partial);
 extern PGDLLIMPORT path_cost_model_active_hook_type path_cost_model_active_hook;
 extern PGDLLIMPORT path_cost_model_batch_hook_type path_cost_model_batch_hook;
+typedef Path *(*parameterized_scan_bind_hook_type) (PlannerInfo *root,
+													 Path *inner_path, Path *outer_path);
+extern PGDLLIMPORT parameterized_scan_bind_hook_type parameterized_scan_bind_hook;
 
 extern void flush_path_cost_model(RelOptInfo *parent_rel);
 
@@ -360,6 +363,8 @@ extern ParamPathInfo *get_appendrel_parampathinfo(RelOptInfo *appendrel,
 												  Relids required_outer);
 extern ParamPathInfo *find_param_path_info(RelOptInfo *rel,
 										   Relids required_outer);
+extern Path *bind_parameterized_scan_context(PlannerInfo *root, Path *inner_path,
+											Path *outer_path);
 extern Bitmapset *get_param_path_clause_serials(Path *path);
 extern RelOptInfo *build_child_join_rel(PlannerInfo *root,
 										RelOptInfo *outer_rel, RelOptInfo *inner_rel,

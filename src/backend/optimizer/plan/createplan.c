@@ -73,6 +73,8 @@
 #define CP_IGNORE_TLIST		0x0008	/* caller will replace tlist */
 
 
+bitmap_index_plan_hook_type bitmap_index_plan_hook = NULL;
+
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path,
 								 int flags);
 static Plan *create_scan_plan(PlannerInfo *root, Path *best_path,
@@ -3478,6 +3480,8 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 		plan->plan_width = 0;	/* meaningless */
 		plan->parallel_aware = false;
 		plan->parallel_safe = ipath->path.parallel_safe;
+		if (bitmap_index_plan_hook)
+			bitmap_index_plan_hook(root, ipath, plan);
 		/* Extract original index clauses, actual index quals, relevant ECs */
 		subquals = NIL;
 		subindexquals = NIL;

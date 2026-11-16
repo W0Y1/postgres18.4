@@ -903,6 +903,7 @@ typedef struct RelOptInfo
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
 	bool		plan_replay_cardinality_id_valid;
+	bool		plan_replay_preserve_fractional_rows;
 	uint64		plan_replay_cardinality_id_hi;
 	uint64		plan_replay_cardinality_id_lo;
 
@@ -1724,6 +1725,7 @@ typedef struct ParamPathInfo
 	bool		plan_replay_cardinality_sequence_valid;
 	uint64		plan_replay_cardinality_sequence;
 	bool		plan_replay_cardinality_id_valid;
+	bool		plan_replay_preserve_fractional_rows;
 	uint64		plan_replay_cardinality_id_hi;
 	uint64		plan_replay_cardinality_id_lo;
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
@@ -1796,6 +1798,9 @@ typedef struct Path
 	 * required outer relids.
 	 */
 	ParamPathInfo *param_info pg_node_attr(write_only_req_outer);
+
+	/* Physical binding belongs to this candidate, never to the shared PPI. */
+	struct Path *plan_replay_physical_driver pg_node_attr(read_write_ignore);
 
 	/* engage parallel-aware logic? */
 	bool		parallel_aware;
@@ -1876,6 +1881,12 @@ typedef struct IndexPath
 	ScanDirection indexscandir;
 	Cost		indextotalcost;
 	Selectivity indexselectivity;
+	/* Separate from path.rows: index candidates before heap filters. */
+	bool index_cardinality_id_valid;
+	uint64 index_cardinality_id_hi;
+	uint64 index_cardinality_id_lo;
+	bool index_matches_exact;
+	bool index_preserve_fractional_rows;
 } IndexPath;
 
 /*

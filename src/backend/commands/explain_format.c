@@ -244,7 +244,7 @@ ExplainPropertyUInteger(const char *qlabel, const char *unit, uint64 value,
 
 /*
  * Explain a float-valued property, using the specified number of
- * fractional digits.
+ * fractional digits, or round-trip significant digits when ndigits is negative.
  */
 void
 ExplainPropertyFloat(const char *qlabel, const char *unit, double value,
@@ -252,7 +252,9 @@ ExplainPropertyFloat(const char *qlabel, const char *unit, double value,
 {
 	char	   *buf;
 
-	buf = psprintf("%.*f", ndigits, value);
+	/* Negative precision requests round-trip significant digits. */
+	buf = ndigits < 0 ? psprintf("%.17g", value) :
+		psprintf("%.*f", ndigits, value);
 	ExplainProperty(qlabel, unit, buf, true, es);
 	pfree(buf);
 }

@@ -43,6 +43,8 @@ typedef struct CardinalityStateEntry
 	PlanReplayCardinalityId *relations;
 	int			nconditions;
 	PlanReplayCardinalityId *conditions;
+	bool		driver_valid;
+	PlanReplayCardinalityId driver;
 } CardinalityStateEntry;
 
 typedef struct ClauseCacheKey
@@ -681,13 +683,15 @@ merge_ids(const PlanReplayCardinalityId *left, int nleft,
 static PlanReplayCardinalityId
 hash_state(CardinalityEstimateKind kind,
 		   PlanReplayCardinalityId *relations, int nrelations,
-		   PlanReplayCardinalityId *conditions, int nconditions)
+		   PlanReplayCardinalityId *conditions, int nconditions,
+		   const PlanReplayCardinalityId *driver)
 {
 	/*
 	 * 这里只输入类型和规范 token 集合。native/effective rows、cost、width、
 	 * sequence、Path 类型等物理或调用时信息都不得影响 cardinality_id。
 	 */
-	pg_cryptohash_ctx *hash = begin_hash("pg_plan_replay_cardinality_id_v1");
+	pg_cryptohash_ctx *hash = begin_hash(driver ?
+		"pg_plan_replay_cardinality_id_driver_v2" : "pg_plan_replay_cardinality_id_v1");
 	int			index;
 
 	hash_uint32(hash, (uint32) kind);
@@ -702,6 +706,11 @@ hash_state(CardinalityEstimateKind kind,
 	{
 		hash_uint64(hash, conditions[index].hi);
 		hash_uint64(hash, conditions[index].lo);
+	}
+	if (driver)
+	{
+		hash_uint64(hash, driver->hi);
+		hash_uint64(hash, driver->lo);
 	}
 	return finish_hash(hash);
 }
@@ -736,10 +745,11 @@ state_descriptor(CardinalityEstimateKind kind,
 static CardinalityStateEntry *
 register_state(CardinalityEstimateKind kind,
 		   PlanReplayCardinalityId *relations, int nrelations,
-		   PlanReplayCardinalityId *conditions, int nconditions)
+		   PlanReplayCardinalityId *conditions, int nconditions,
+		   const PlanReplayCardinalityId *driver)
 {
 	PlanReplayCardinalityId id = hash_state(kind, relations, nrelations,
-										conditions, nconditions);
+										conditions, nconditions, driver);
 	CardinalityStateEntry *entry;
 	bool		found;
 
@@ -747,7 +757,9 @@ register_state(CardinalityEstimateKind kind,
 	if (found)
 	{
 		/* 相同 ID 必须逐项对应同一规范状态，不能静默接受截断哈希碰撞。 */
-		if (entry->kind != kind ||
+		if (entry->driver_valid != (driver != NULL) ||
+			(driver && !cardinality_id_equal(entry->driver, *driver)) ||
+			entry->kind != kind ||
 			entry->nrelations != nrelations ||
 			entry->nconditions != nconditions ||
 			(nrelations > 0 &&
@@ -786,6 +798,9 @@ register_state(CardinalityEstimateKind kind,
 		pfree(descriptor);
 	}
 	entry->kind = kind;
+	entry->driver_valid = driver != NULL;
+	if (driver)
+		entry->driver = *driver;
 	entry->nrelations = nrelations;
 	entry->nconditions = nconditions;
 	pfree(relations);
@@ -846,7 +861,7 @@ state_for_rel(PlannerInfo *root, RelOptInfo *rel)
 		conditions = sort_unique_ids(extra, nextra, &nconditions);
 		pfree(extra);
 		return register_state(CARDINALITY_ESTIMATE_BASE, relations, nrelations,
-							  conditions, nconditions);
+							  conditions, nconditions, NULL);
 	}
 	elog(ERROR, "input relation has no cardinality ID");
 	return NULL;
@@ -992,6 +1007,8 @@ plan_replay_compute_cardinality_id(PlannerInfo *root,
 	int			nextra = 0;
 	int			index = 0;
 	CardinalityStateEntry *state;
+	PlanReplayCardinalityId driver;
+	PlanReplayCardinalityId *driver_ptr = NULL;
 
 	/*
 	 * 第一步：把当前层 restrictlist 转成带角色的条件 token。子关系以前层次
@@ -1004,9 +1021,12 @@ plan_replay_compute_cardinality_id(PlannerInfo *root,
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
 		CardinalityConditionRole role = CARDINALITY_CONDITION_QUAL;
 
-		if (context->kind == CARDINALITY_ESTIMATE_BASE)
+		if (context->kind == CARDINALITY_ESTIMATE_BASE ||
+			(context->kind == CARDINALITY_ESTIMATE_INDEX_MATCH &&
+			 bms_is_subset(rinfo->required_relids, context->rel->relids)))
 			role = CARDINALITY_CONDITION_FILTER;
-		else if (context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_BASE)
+		else if (context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_BASE ||
+				 context->kind == CARDINALITY_ESTIMATE_INDEX_MATCH)
 			role = bms_is_subset(rinfo->required_relids, context->rel->relids) ?
 				CARDINALITY_CONDITION_FILTER : CARDINALITY_CONDITION_PARAMETER;
 		else if (context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN &&
@@ -1029,7 +1049,8 @@ plan_replay_compute_cardinality_id(PlannerInfo *root,
 
 	/* 第二步：基表创建初始状态；Join 对两个输入的累计状态做集合并集。 */
 	if (context->kind == CARDINALITY_ESTIMATE_BASE ||
-		context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_BASE)
+		context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_BASE ||
+		context->kind == CARDINALITY_ESTIMATE_INDEX_MATCH)
 	{
 		PlanReplayCardinalityId relation = relation_token(root, context->rel->relid);
 
@@ -1072,7 +1093,9 @@ plan_replay_compute_cardinality_id(PlannerInfo *root,
 	 * restrictlist 中以 PARAMETER 角色进入 layer，两者缺一都会导致误匹配。
 	 */
 	if (context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_BASE ||
-		context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN)
+		context->kind == CARDINALITY_ESTIMATE_PARAMETERIZED_JOIN ||
+		(context->kind == CARDINALITY_ESTIMATE_INDEX_MATCH &&
+		 !bms_is_empty(context->required_outer)))
 	{
 		PlanReplayCardinalityId required =
 			required_outer_token(root, context->required_outer);
@@ -1084,8 +1107,13 @@ plan_replay_compute_cardinality_id(PlannerInfo *root,
 		nconditions = index;
 	}
 	pfree(layer);
+	if (context->driving_path != NULL)
+	{
+		driver = state_for_path(root, context->driving_path)->id;
+		driver_ptr = &driver;
+	}
 	state = register_state(context->kind, relations, nrelations,
-						   conditions, nconditions);
+						   conditions, nconditions, driver_ptr);
 	return state->id;
 }
 

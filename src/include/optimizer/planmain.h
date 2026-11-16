@@ -40,6 +40,9 @@ extern void preprocess_minmax_aggregates(PlannerInfo *root);
  * prototypes for plan/createplan.c
  */
 extern Plan *create_plan(PlannerInfo *root, Path *best_path);
+typedef void (*bitmap_index_plan_hook_type) (PlannerInfo *root,
+												IndexPath *path, Plan *plan);
+extern PGDLLIMPORT bitmap_index_plan_hook_type bitmap_index_plan_hook;
 extern ForeignScan *make_foreignscan(List *qptlist, List *qpqual,
 									 Index scanrelid, List *fdw_exprs, List *fdw_private,
 									 List *fdw_scan_tlist, List *fdw_recheck_quals,

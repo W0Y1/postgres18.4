@@ -51,6 +51,7 @@ typedef enum
 
 path_cost_model_active_hook_type path_cost_model_active_hook = NULL;
 path_cost_model_batch_hook_type path_cost_model_batch_hook = NULL;
+parameterized_scan_bind_hook_type parameterized_scan_bind_hook = NULL;
 
 static void add_path_native(RelOptInfo *parent_rel, Path *new_path);
 static void add_partial_path_native(RelOptInfo *parent_rel, Path *new_path);
@@ -324,6 +325,14 @@ copy_path_cardinality_identity(Path *path)
 		path->plan_replay_cardinality_id_lo =
 			path->parent->plan_replay_cardinality_id_lo;
 	}
+}
+
+/* Plugins bind concrete scan contexts before native join prechecks. */
+Path *
+bind_parameterized_scan_context(PlannerInfo *root, Path *inner_path, Path *outer_path)
+{
+	return parameterized_scan_bind_hook ?
+		parameterized_scan_bind_hook(root, inner_path, outer_path) : inner_path;
 }
 
 /*
@@ -4826,6 +4835,8 @@ do { \
 		new_ppi = makeNode(ParamPathInfo);
 		new_ppi->ppi_req_outer = bms_copy(required_outer);
 		new_ppi->ppi_rows = old_ppi->ppi_rows;
+		new_ppi->plan_replay_preserve_fractional_rows =
+			old_ppi->plan_replay_preserve_fractional_rows;
 		new_ppi->plan_replay_cardinality_sequence_valid =
 			old_ppi->plan_replay_cardinality_sequence_valid;
 		new_ppi->plan_replay_cardinality_sequence =

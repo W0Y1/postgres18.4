@@ -515,8 +515,36 @@ Join 方法和 Path 属性。普通 INNER Join 只合并排序去重后的关系
 ```
 
 同一 ID 可命中多次调用。重复 ID、非法/大写 ID、负数、非有限值、缺失 header 和
-旧的一列顺序格式都会立即报错。`rows` 仍经过 PostgreSQL 的 `clamp_row_est()`；
-参数化估计还保留“不超过对应普通关系估计”的核心约束。遇到无法取得实际值的
+旧的一列顺序格式都会立即报错。明确命中的有限正小数 `rows` 保留其精度，
+包括小于 1 的参数化平均行数；标记随关系或参数化估计传播，避免并行分摊时再次取整，
+EXPLAIN 的 Plan Rows 也保留小数。未命中的原生估计和零值仍沿用 `clamp_row_est()`，
+参数化估计仍保留“不超过对应普通关系估计”的核心约束。这不重写索引 AM 的访问成本。
+
+参数化基表扫描现在在 Nested Loop 组合具体输入时绑定外侧逻辑基数 ID。
+基数哈希在原有表、过滤、参数条件和 required_outer 之外，增加驱动子树 ID；
+使用 `pg_plan_replay_cardinality_id_driver_v2` 域。普通非参数化关系 ID 不变。
+上下文绑定发生在普通和部分 Nested Loop 的成本预检查之前；扩展维护的语句级缓存按
+关系、required_outer 和驱动逻辑 ID 区分，保留未绑定模板，不修改原生 `rel->ppilist`。
+Index Scan、Index Only Scan、Bitmap Heap Scan、Seq Scan 及其 Memoize/Material
+包装支持该绑定。参数化 Join、分区重参数化等其他路径尚未扩展此绑定入口。
+历史参数化基表 ID 必须重新采集；未绑定的参数化模板不再接受 rows 回放，
+不能把旧文件的格式头改一下继续使用。原 rows format=2 文件语法不变。
+
+物理上下文属于具体 `Path`，不从共享 PPI 推断实际驱动方案。绑定后的物理 ID
+为原物理描述符追加实际 outer Path 的物理 ID 后计算的哈希，不包含驱动基数 ID
+或 rows/cost 数值。克隆时清除旧物理 ID 和候选序号缓存；即使行数未变化，也重新
+捕获并匹配代价回放和剪枝。Memoize/Material 包装路径及其扫描子路径一同绑定。
+未绑定模板可以采集，但跳过代价回放、剪枝、未命中惩罚和在线预测，直到具体上下文
+出现。普通非参数化物理 ID 规则不变；历史参数化物理 ID 需要重新采集。
+
+绑定、PPI 缓存、扫描克隆与重新估价均位于扩展 `src/path_binding.c`。
+内核只在 Nested Loop 预检查前调用 `parameterized_scan_bind_hook`，并传递必要的
+Path 元数据；小数行数的安全截断与并行传播仍由核心估价函数处理。
+
+安装并重启匹配的内核和扩展后，可执行
+`Debug/job/agent-venv/bin/python src/backend/optimizer/path/pg_plan_replay/tests/test_parameter_context.py`
+运行隔离 schema 下的定向验证；17b 案例只检查计划及稀疏回放，不做性能测量。
+此更新改变内部估计上下文和节点元数据，须停库安装并重编译相关扩展。遇到无法取得实际值的
 `PARAM_EXTERN` 时，replay 会拒绝规划，避免错误命中另一组参数值。
 
 这部分移植自 PostgreSQL 13.1 实验代码，但针对 PostgreSQL 18.4 做了接口适配：
@@ -555,3 +583,57 @@ make -C tests PG_CONFIG=/home/pgdev/postgresql-18.4/Debug/install/bin/pg_config
 ```
 
 使用 `CREATE FUNCTION pg_temp.identity_test() RETURNS boolean AS '<绝对路径>/tests/pg_plan_replay_identity_test', 'plan_replay_identity_test' LANGUAGE C; SELECT pg_temp.identity_test();` 验证估价和 EC 缓存不改变 ID，真实表达式、类型、排序、参数化和条件改变 ID，以及 GEQO 临时上下文释放后的描述符存活。测试模块不安装、不在生产连接加载。
+
+## Bitmap Index Scan 的身份与候选基数
+
+Bitmap Index Scan 是 `IndexPath` 生成的辅助节点，而不是独立加入关系
+`pathlist` 的元组输出候选。旧实现从 IndexScan 临时计划重建它时没有复制
+回放身份，而且 EXPLAIN 原先只显示带候选序号的 Path ID。
+
+现在该节点保留原 `IndexPath` 的 Path ID；序号仍然仅表示真实候选的捕获位置，
+不会为辅助子节点虚构候选序号。Path ID 的显示不表示该子节点可被独立剪枝或
+独立覆盖其位图构建代价；现有剪枝仍要求真实候选及命中证据。
+
+基数使用新增的 `CARDINALITY_ESTIMATE_INDEX_MATCH` 域：规范化索引条件、
+部分索引谓词及所需外部参数，和 Heap Scan 的完整关系输出基数分开。
+EXPLAIN 用 `Plan Replay Cardinality Scope=index_candidates` 标记。
+堆侧的额外 qpqual 不进入该身份，索引条件改变则身份改变。
+
+精确 B-tree 条件可通过现有 rows format=2 入口回放索引匹配数量，更新
+`indexselectivity`，供后续 bitmap heap 页数/回表成本估算使用；不会把这个值
+写入基表或参数化关系输出行数。当前不重写 AM 内部的索引访问成本公式。
+近似 AM（如 GIN）及 lossy IndexClause 仍提供身份，但不提供可注入的精确行数
+范围元数据，Agent 必须将其排除出自动观测基数注入。
+位图构建不按 Heap Scan 的并行 worker 除数缩放；其候选数除数为 1。
+
+参数化 Bitmap Heap 绑定实际 outer 时，递归克隆其参数化 `bitmapqual` 子树，
+包括 BitmapAnd/BitmapOr 中的索引路径。每个克隆清除旧物理 ID 和序号缓存，
+索引候选基数 ID 使用实际驱动的逻辑身份，物理 ID 使用实际驱动的物理身份。
+索引选择率或成本变化时，逐层重算 AND/OR 和 Heap 成本；仅绑定身份时保留
+原生估价。没有参数依赖的子节点继续复用原路径，身份保持不变。
+辅助位图子节点不经过独立候选的代价回放、剪枝或捕获批次；它们的身份由父路径
+描述符递归计算并由计划节点输出。Heap 输出 rows 与索引候选 rows 仍是两个独立域。
+
+索引候选身份和基数回放通过 `index_cardinality_hook` 在扩展中处理；
+`bitmap_index_plan_hook` 负责将元数据复制到辅助计划节点。Bitmap 专属 EXPLAIN
+字段使用现有 `explain_per_node_hook` 输出，不在核心 EXPLAIN 中增加特殊分支。
+
+修改了 IndexPath 结构，切换前需停库，完整重编译 PostgreSQL 和依赖该结构的
+pg_plan_replay、pg_hint_plan。历史计划文件不会被修改，新增节点身份只在新规划
+中可见。现有旧类型 ID 的哈希域未改变。
+
+定向数据库验证（Debug 实例已启动）：
+
+```bash
+Debug/job/agent-venv/bin/python \
+  src/backend/optimizer/path/pg_plan_replay/tests/test_bitmap_index_ids.py
+```
+
+`tests/test_parameterized_bitmap.py before --output <目录>` 和对应的 `after`
+阶段用于跨扩展版本比较；`--library <绝对路径>` 可在独立测试连接加载备份扩展，
+不需要替换服务器安装。测试使用关闭自动维护的隔离表，手动 ANALYZE 后固定统计，
+覆盖参数化单索引、AND、OR、嵌套、混合常量子节点、分数基数、驱动隔离和 Memoize。
+
+该测试在 imdb_job 创建唯一测试 schema 并在结束时删除，保留计划与回放证据到
+Debug/job/bitmap_validation_TIMESTAMP。覆盖原生无干预计划一致、ID 稳定性、索引与
+堆身份隔离、谓词变化、稀疏注入、BitmapOr、部分索引与近似 GIN 边界。
